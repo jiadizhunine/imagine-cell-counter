@@ -1,0 +1,20 @@
+# Build artifacts
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# Example data (too large for git)
+example/
+
+# IDE
+.vscode/
+.idea/
+
+# Packaged app (release via GitHub Releases)
+Imagine.exe
+_internal/
+
+# Annotation saves
+*.annotations.json
