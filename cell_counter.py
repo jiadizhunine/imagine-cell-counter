@@ -996,7 +996,7 @@ STRATEGIES = {
         "name": "AT1 数量",
         "desc": "HOPX+ 细胞计数",
         "requires": ["HOPX"],
-        "method": "count_at1",
+        "method": "count_colocalized_filtered",
         "marker_channel": "green",
     },
     "AT1_proliferation": {
@@ -1096,54 +1096,20 @@ def count_colocalized(labels, marker_data, threshold):
     return [i + 1 for i, m in enumerate(means) if m >= threshold]
 
 
-def count_at1(labels, marker_data, threshold, ring_width=8):
-    """Count AT1 cells using hybrid nuclear + perinuclear ring detection.
+def count_colocalized_filtered(labels, marker_data, threshold):
+    """Like count_colocalized but with median filtering to reduce noise.
 
-    AT1 cells are flat squamous cells where HOPX signal extends beyond the
-    nucleus. We check BOTH nuclear interior AND a narrow perinuclear ring,
-    counting a cell as positive if either region exceeds the threshold.
-    Also applies median filtering to reduce noise from staining artifacts.
+    HOPX is a nuclear transcription factor — signal is inside the nucleus.
+    Median filtering removes staining artifacts and floating color before
+    computing nuclear mean intensity.
     """
     from scipy.ndimage import median_filter
     n = labels.max()
     if n == 0:
         return []
-
-    # Median filter to reduce noise/artifacts (3x3 kernel)
     filtered = median_filter(marker_data, size=3)
-
-    # Nuclear means
-    nuclear_means = ndimage.mean(filtered, labels, range(1, n + 1))
-
-    # Ring-based detection (narrower ring than AT2)
-    slices = ndimage.find_objects(labels)
-    pad = ring_width + 2
-    h, w = labels.shape
-    struct = ndimage.generate_binary_structure(2, 1)
-    ring_means = np.zeros(n, dtype=np.float64)
-
-    for lbl_idx, sl in enumerate(slices):
-        if sl is None:
-            continue
-        r0 = max(0, sl[0].start - pad)
-        r1 = min(h, sl[0].stop + pad)
-        c0 = max(0, sl[1].start - pad)
-        c1 = min(w, sl[1].stop + pad)
-        patch_labels = labels[r0:r1, c0:c1]
-        patch_mask = patch_labels == (lbl_idx + 1)
-        dilated = ndimage.binary_dilation(patch_mask, structure=struct, iterations=ring_width)
-        ring = dilated & ~patch_mask
-        if ring.any():
-            ring_means[lbl_idx] = filtered[r0:r1, c0:c1][ring].mean()
-
-    # Positive if nuclear OR ring signal exceeds threshold
-    # Use a slightly lower threshold for the combined signal
-    positives = []
-    for i in range(n):
-        best = max(nuclear_means[i], ring_means[i])
-        if best >= threshold:
-            positives.append(i + 1)
-    return positives
+    means = ndimage.mean(filtered, labels, range(1, n + 1))
+    return [i + 1 for i, m in enumerate(means) if m >= threshold]
 
 
 def count_double_positive(labels, marker_data, second_data, marker_thresh, second_thresh):
@@ -1867,17 +1833,16 @@ def analyze_czi(filepath, params, progress_fn=None):
                 "positive_labels": positive_labels,
             })
 
-        elif strat["method"] == "count_at1":
-            # AT1 hybrid nuclear + ring detection
+        elif strat["method"] == "count_colocalized_filtered":
+            # Nuclear detection with median filtering (for HOPX etc.)
             if marker_ch == "red":
                 thresh_key = "red_thresh"
             elif marker_ch == "white":
                 thresh_key = "white_thresh"
             else:
                 thresh_key = "green_thresh"
-            positive_labels = count_at1(
+            positive_labels = count_colocalized_filtered(
                 labels, data[channel_map[marker_ch]], params.get(thresh_key, 15),
-                ring_width=max(5, params.get("ring_width", 15) // 2),
             )
             pct = (len(positive_labels) / total * 100) if total > 0 else 0
             strategy_results.append({
@@ -2285,13 +2250,24 @@ class MainWindow(QMainWindow):
         nuc_group.setLayout(nuc_layout)
         left_layout.addWidget(nuc_group)
 
-        # -- Analyze button --
-        self.analyze_btn = QPushButton("  开始分析  ")
+        # -- Analyze buttons row --
+        analyze_row = QHBoxLayout()
+        analyze_row.setSpacing(8)
+
+        self.analyze_btn = QPushButton("开始分析")
         self.analyze_btn.setObjectName("accentBtn")
         self.analyze_btn.setToolTip("分析当前文件 (Ctrl+R)")
         self.analyze_btn.setShortcut("Ctrl+R")
         self.analyze_btn.clicked.connect(self.run_analysis)
-        left_layout.addWidget(self.analyze_btn)
+        analyze_row.addWidget(self.analyze_btn)
+
+        self.analyze_all_btn = QPushButton("批量分析")
+        self.analyze_all_btn.setObjectName("accentBtn")
+        self.analyze_all_btn.setToolTip("分析所有已打开的文件")
+        self.analyze_all_btn.clicked.connect(self.run_analysis_all)
+        analyze_row.addWidget(self.analyze_all_btn)
+
+        left_layout.addLayout(analyze_row)
 
         # -- Progress bar (hidden) --
         self.progress_bar = QProgressBar()
@@ -3124,6 +3100,7 @@ class MainWindow(QMainWindow):
             return
 
         self.analyze_btn.setEnabled(False)
+        self.analyze_all_btn.setEnabled(False)
         self.progress_bar.show()
         self.status_label.setText("正在分析...")
         self._analysis_start_time = time.time()
@@ -3135,9 +3112,35 @@ class MainWindow(QMainWindow):
         self.worker.error.connect(self._on_analysis_error)
         self.worker.start()
 
+    def run_analysis_all(self):
+        """Batch analyze all currently opened files in _file_list."""
+        if not self._file_list:
+            QMessageBox.warning(self, "提示", "请先打开文件")
+            return
+        if len(self._file_list) == 1:
+            # Only one file, just run normal analysis
+            self.run_analysis()
+            return
+
+        self.analyze_btn.setEnabled(False)
+        self.analyze_all_btn.setEnabled(False)
+        self.progress_bar.setRange(0, len(self._file_list))
+        self.progress_bar.setValue(0)
+        self.progress_bar.show()
+        self.status_label.setText(f"批量分析: 0/{len(self._file_list)}")
+
+        params = self._get_params()
+        self.batch_worker = BatchWorker(list(self._file_list), params)
+        self.batch_worker.file_done.connect(self._on_batch_file_done)
+        self.batch_worker.progress_count.connect(self._on_batch_progress)
+        self.batch_worker.error.connect(self._on_batch_error)
+        self.batch_worker.all_done.connect(self._on_batch_done)
+        self.batch_worker.start()
+
     def _on_analysis_done(self, result):
         self.current_result = result
         self.analyze_btn.setEnabled(True)
+        self.analyze_all_btn.setEnabled(True)
         self.progress_bar.hide()
 
         elapsed = result.get("elapsed", time.time() - self._analysis_start_time)
@@ -3179,6 +3182,7 @@ class MainWindow(QMainWindow):
 
     def _on_analysis_error(self, msg):
         self.analyze_btn.setEnabled(True)
+        self.analyze_all_btn.setEnabled(True)
         self.progress_bar.hide()
         self.status_label.setText("分析出错")
         QMessageBox.critical(self, "分析错误", msg)
@@ -3491,6 +3495,7 @@ class MainWindow(QMainWindow):
 
     def _on_batch_done(self):
         self.analyze_btn.setEnabled(True)
+        self.analyze_all_btn.setEnabled(True)
         self.progress_bar.hide()
         n = self.progress_bar.maximum()
         self.status_label.setText("批量处理完成")
