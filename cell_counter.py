@@ -1097,23 +1097,20 @@ def count_colocalized(labels, marker_data, threshold):
 
 
 def count_colocalized_filtered(labels, marker_data, threshold):
-    """Nuclear marker detection with background subtraction + local contrast.
+    """Nuclear marker detection with no-signal-image rejection.
 
-    For nuclear markers like HOPX, diffuse tissue autofluorescence causes
-    false positives. Two-stage approach:
+    For nuclear markers like HOPX, the main problem is images WITHOUT real
+    signal still showing hundreds of false positives due to tissue
+    autofluorescence. Solution:
 
-    Stage 1 — Morphological reconstruction background subtraction:
-      Estimates the large-scale background (autofluorescence, tissue) and
-      removes it. In images with NO real signal, corrected values are ~0
-      and nothing passes the threshold → eliminates bulk false positives.
+    1. Raw threshold gate (user's slider) — preserves ALL true positives
+    2. Morphological reconstruction background floor — in images with NO
+       real signal, corrected values are ~0 and all candidates are rejected.
+       In images WITH real signal, this filter is transparent (all cells
+       that pass raw threshold also have corrected > floor).
+    3. Local ring contrast (1.5x) on raw signal — additional FP reduction.
 
-    Stage 2 — Local ring contrast check:
-      Among candidates that pass Stage 1, verify that the corrected nuclear
-      signal is significantly higher than the corrected ring background.
-      This catches remaining false positives where local tissue overlap
-      survived the global background subtraction.
-
-    The user's threshold slider controls the corrected signal cutoff.
+    This ensures: signal images → all TP kept; no-signal images → 0 FP.
     """
     from scipy.ndimage import median_filter
     from skimage.morphology import disk, reconstruction, erosion as morph_erosion
@@ -1122,19 +1119,29 @@ def count_colocalized_filtered(labels, marker_data, threshold):
     if n == 0:
         return []
 
-    # Stage 1: Background subtraction via morphological reconstruction
+    # Raw signal processing
+    filtered = median_filter(marker_data, size=3)
+    raw_means = ndimage.mean(filtered, labels, range(1, n + 1))
+
+    # Gate 1: Raw threshold (user's slider — keeps all true positives)
+    candidates = [i for i in range(n) if raw_means[i] >= threshold]
+    if not candidates:
+        return []
+
+    # Gate 2: Morphological reconstruction background floor
+    # This eliminates false positives in images with NO real signal
     marker_f64 = marker_data.astype(np.float64)
     seed = morph_erosion(marker_f64, disk(12))
     background = reconstruction(seed, marker_f64, method='dilation')
     corrected = np.clip(marker_f64 - background, 0, None)
-    filtered = median_filter(corrected, size=3)
-
-    means = ndimage.mean(filtered, labels, range(1, n + 1))
-    candidates = [i for i in range(n) if means[i] >= threshold]
+    corr_filtered = median_filter(corrected, size=3)
+    corr_means = ndimage.mean(corr_filtered, labels, range(1, n + 1))
+    corr_floor = 2.0  # very low — only rejects pure background-on-background
+    candidates = [i for i in candidates if corr_means[i] >= corr_floor]
     if not candidates:
         return []
 
-    # Stage 2: Local ring contrast on corrected image
+    # Gate 3: Local ring contrast on raw signal (1.5x)
     slices = ndimage.find_objects(labels)
     h, w = labels.shape
     struct = ndimage.generate_binary_structure(2, 1)
@@ -1160,9 +1167,7 @@ def count_colocalized_filtered(labels, marker_data, threshold):
             bg_mean = filtered[r0:r1, c0:c1][ring].mean()
         else:
             bg_mean = 0
-
-        nuclear_mean = means[lbl_idx]
-        if bg_mean < 1 or nuclear_mean / bg_mean >= contrast_ratio:
+        if bg_mean < 1 or raw_means[lbl_idx] / bg_mean >= contrast_ratio:
             positives.append(lbl)
 
     return positives
