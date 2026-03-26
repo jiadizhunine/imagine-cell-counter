@@ -1007,11 +1007,20 @@ STRATEGIES = {
 
 # Color mapping for strategy display
 STRATEGY_COLORS = {
-    "AT2_number": "#e0e0e0",
-    "AT2_proliferation": "#f87171",
-    "AT1_number": "#4ade80",
-    "AT1_proliferation": "#f87171",
+    "AT2_number": "#e0e0e0",       # White/gray
+    "AT2_proliferation": "#f87171", # Red
+    "AT1_number": "#4ade80",        # Green
+    "AT1_proliferation": "#a78bfa", # Purple
 }
+
+TAG_COLORS = [
+    ("#FFD700", "Tag A"),  # Gold
+    ("#FF6B6B", "Tag B"),  # Red
+    ("#4ECDC4", "Tag C"),  # Teal
+    ("#45B7D1", "Tag D"),  # Blue
+    ("#96CEB4", "Tag E"),  # Green
+    ("#DDA0DD", "Tag F"),  # Plum
+]
 
 
 def detect_markers_from_filename(filepath):
@@ -1087,7 +1096,8 @@ class ImageViewer(QWidget):
         self._offset = QPointF(0, 0)
         self._drag_start = None
         self._drag_offset = QPointF(0, 0)
-        self._annotations = []      # list of (x, y) in image coordinates
+        self._annotations = []      # list of (x, y, color_tag) in image coordinates
+        self._current_tag = 0       # index into TAG_COLORS
         self._annotation_mode = False
         self._undo_stack = []
         self._redo_stack = []
@@ -1105,15 +1115,24 @@ class ImageViewer(QWidget):
         self._annotation_mode = bool(value)
 
     def set_annotations(self, points):
-        """Set annotations from loaded Fiji data (list of (x,y) tuples)."""
+        """Set annotations from loaded Fiji data.
+        Accepts both (x,y) and (x,y,tag) tuples for backward compatibility.
+        Old-style (x,y) tuples are converted to (x,y,0).
+        """
         self._undo_stack.append(list(self._annotations))
         self._redo_stack.clear()
-        self._annotations = list(points)
+        normalized = []
+        for p in points:
+            if len(p) == 3:
+                normalized.append(tuple(p))
+            else:
+                normalized.append((p[0], p[1], 0))
+        self._annotations = normalized
         self.update()
         self.annotations_changed.emit()
 
     def get_annotations(self):
-        """Return current annotation points."""
+        """Return current annotation points as list of (x, y, tag) tuples."""
         return list(self._annotations)
 
     def clear_annotations(self):
@@ -1147,6 +1166,11 @@ class ImageViewer(QWidget):
         self.update()
         self.zoom_changed.emit(self._zoom)
 
+    def update_pixmap(self, pixmap: QPixmap):
+        """Update displayed pixmap without resetting zoom/offset."""
+        self._pixmap = pixmap
+        self.update()
+
     def _screen_to_image(self, screen_pos):
         """Convert a screen (widget) position to image pixel coordinates."""
         img_x = (screen_pos.x() - self._offset.x()) / self._zoom
@@ -1173,8 +1197,6 @@ class ImageViewer(QWidget):
 
         if self._annotations:
             cross_size = 8
-            ann_color = QColor("#FFD700")
-            pen = QPen(ann_color, 2)
             painter.setRenderHint(QPainter.Antialiasing)
 
             font = QFont()
@@ -1182,7 +1204,26 @@ class ImageViewer(QWidget):
             font.setBold(True)
             painter.setFont(font)
 
-            for idx, (ix, iy) in enumerate(self._annotations):
+            # Group annotations by tag for independent numbering
+            tag_counters = {}  # tag_index -> running count
+            for ann in self._annotations:
+                # Handle both old-style (x,y) and new (x,y,tag) tuples
+                if len(ann) == 3:
+                    ix, iy, tag = ann
+                else:
+                    ix, iy = ann[0], ann[1]
+                    tag = 0
+
+                tag_counters[tag] = tag_counters.get(tag, 0) + 1
+                idx_in_tag = tag_counters[tag]
+
+                # Get color for this tag
+                if 0 <= tag < len(TAG_COLORS):
+                    ann_color = QColor(TAG_COLORS[tag][0])
+                else:
+                    ann_color = QColor("#FFD700")
+                pen = QPen(ann_color, 2)
+
                 sx, sy = self._image_to_screen(ix, iy)
 
                 # Draw cross (+)
@@ -1197,7 +1238,7 @@ class ImageViewer(QWidget):
                 )
 
                 # Draw number label with dark background
-                label_text = str(idx + 1)
+                label_text = str(idx_in_tag)
                 fm = painter.fontMetrics()
                 text_w = fm.horizontalAdvance(label_text) + 4
                 text_h = fm.height() + 2
@@ -1241,7 +1282,8 @@ class ImageViewer(QWidget):
 
         # Check if clicking near an existing annotation (within 10px screen radius)
         remove_idx = -1
-        for idx, (ax, ay) in enumerate(self._annotations):
+        for idx, ann in enumerate(self._annotations):
+            ax, ay = ann[0], ann[1]
             sx, sy = self._image_to_screen(ax, ay)
             dist = ((pos.x() - sx) ** 2 + (pos.y() - sy) ** 2) ** 0.5
             if dist <= 10:
@@ -1260,7 +1302,7 @@ class ImageViewer(QWidget):
                 pw = self._pixmap.width()
                 ph = self._pixmap.height()
                 if 0 <= img_x < pw and 0 <= img_y < ph:
-                    self._annotations.append((int(round(img_x)), int(round(img_y))))
+                    self._annotations.append((int(round(img_x)), int(round(img_y)), self._current_tag))
 
         self.update()
         self.annotations_changed.emit()
@@ -1502,17 +1544,28 @@ def detect_channels(meta_xml, filepath=None):
 
 def segment_nuclei(dapi, auto_thresh, manual_thresh, min_size, max_size=5000):
     """Segment nuclei from DAPI channel. Returns labelled array."""
-    blurred = gaussian(dapi.astype(np.float64), sigma=2)
+    blurred = gaussian(dapi.astype(np.float64), sigma=3)
 
     if auto_thresh:
         try:
-            thresh = threshold_otsu(blurred)
+            otsu = threshold_otsu(blurred)
+            # Use triangle method as fallback for skewed distributions
+            from skimage.filters import threshold_triangle
+            try:
+                tri = threshold_triangle(blurred)
+            except Exception:
+                tri = otsu
+            # Take the lower of Otsu and triangle — better for dim nuclei
+            thresh = min(otsu, tri)
         except ValueError:
             thresh = manual_thresh
     else:
         thresh = manual_thresh / 255.0 * blurred.max() if blurred.max() > 0 else manual_thresh
 
     binary = blurred > thresh
+    # Morphological opening to remove small noise before filling holes
+    from scipy.ndimage import binary_opening
+    binary = binary_opening(binary, iterations=1)
     binary = binary_fill_holes(binary)
     binary = remove_small_objects(binary, max_size=min_size)
 
@@ -2220,6 +2273,14 @@ class MainWindow(QMainWindow):
         self.annotation_mode_btn.clicked.connect(self._toggle_annotation_mode)
         toggle_layout.addWidget(self.annotation_mode_btn)
 
+        self.tag_combo = QComboBox()
+        for i, (color, name) in enumerate(TAG_COLORS):
+            self.tag_combo.addItem(f"{name}")
+        self.tag_combo.setFixedWidth(90)
+        self.tag_combo.setToolTip("选择标注颜色标签")
+        self.tag_combo.currentIndexChanged.connect(self._on_tag_changed)
+        toggle_layout.addWidget(self.tag_combo)
+
         self.clear_annotations_btn = QPushButton("清除标注")
         self.clear_annotations_btn.setObjectName("toggleBtn")
         self.clear_annotations_btn.setStyleSheet(
@@ -2333,6 +2394,8 @@ class MainWindow(QMainWindow):
         self.results_table.setSelectionMode(QTableWidget.SingleSelection)
         # FEATURE 5: Double-click to jump to file
         self.results_table.cellDoubleClicked.connect(self._on_table_double_click)
+        self.results_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.results_table.customContextMenuRequested.connect(self._on_table_context_menu)
         batch_layout.addWidget(self.results_table)
         batch_group.setLayout(batch_layout)
         right_layout.addWidget(batch_group)
@@ -2457,14 +2520,7 @@ class MainWindow(QMainWindow):
                 btn.clicked.connect(self._refresh_display)
                 self._strategy_overlay_layout.addWidget(btn)
                 self._strategy_overlay_btns[skey] = btn
-        else:
-            # Fallback: show legacy YAP+/AT2 buttons
-            self.show_yap_btn.show()
-            self._strategy_overlay_layout.addWidget(self.show_yap_btn)
-            self._strategy_overlay_btns["__legacy_yap"] = self.show_yap_btn
-            self.show_at2_btn.show()
-            self._strategy_overlay_layout.addWidget(self.show_at2_btn)
-            self._strategy_overlay_btns["__legacy_at2"] = self.show_at2_btn
+        # else: no strategies detected — don't show any overlay buttons
 
     # ----- FEATURE 5: Double-click table row to jump to file -----
     def _on_table_double_click(self, row, col):
@@ -2512,6 +2568,31 @@ class MainWindow(QMainWindow):
         self._update_nav_label()
 
         self.statusBar().showMessage(f"已跳转至: {os.path.basename(filepath)}")
+
+    def _on_table_context_menu(self, pos):
+        """Show context menu for batch results table."""
+        row = self.results_table.rowAt(pos.y())
+        if row < 0:
+            return
+        from PyQt5.QtWidgets import QMenu
+        menu = QMenu(self)
+        delete_action = menu.addAction("删除")
+        delete_all_action = menu.addAction("清空全部")
+        action = menu.exec_(self.results_table.viewport().mapToGlobal(pos))
+        if action == delete_action:
+            # Remove from batch_results list
+            if row < len(self.batch_results):
+                removed = self.batch_results.pop(row)
+                # Also remove from cache
+                fp = removed.get("filepath", "")
+                if fp in self._batch_results_by_path:
+                    del self._batch_results_by_path[fp]
+            # Remove table row
+            self.results_table.removeRow(row)
+        elif action == delete_all_action:
+            self.results_table.setRowCount(0)
+            self.batch_results.clear()
+            self._batch_results_by_path.clear()
 
     # ----- FEATURE 6: File navigation -----
     def _update_nav_label(self):
@@ -2632,8 +2713,10 @@ class MainWindow(QMainWindow):
             if applicable:
                 names = [STRATEGIES[k]["name"] for k in applicable]
                 self.strategy_label.setText(f"检测到策略: {' + '.join(names)}")
+                self.strategy_label.show()
             else:
-                self.strategy_label.setText("检测到策略: --")
+                self.strategy_label.setText("")
+                self.strategy_label.hide()
 
             # BUG 1: Update channel labels based on detected markers
             self._update_channel_labels(detected_markers)
@@ -2653,13 +2736,34 @@ class MainWindow(QMainWindow):
     def _toggle_annotation_mode(self, checked):
         self.viewer.annotation_mode = checked
 
+    def _on_tag_changed(self, index):
+        """Update the current tag color on the viewer."""
+        self.viewer._current_tag = index
+
     def _clear_annotations(self):
         self.viewer.clear_annotations()
 
     def _update_annotation_count(self):
-        count = len(self.viewer.get_annotations())
-        self.annotation_count_label.setText(f"{count} 个标注点")
-        self.fiji_ann_label.setText(str(count) if count > 0 else "--")
+        annotations = self.viewer.get_annotations()
+        total = len(annotations)
+        # Count per tag
+        tag_counts = {}
+        for ann in annotations:
+            tag = ann[2] if len(ann) == 3 else 0
+            tag_counts[tag] = tag_counts.get(tag, 0) + 1
+        if tag_counts:
+            parts = []
+            for tag_idx in sorted(tag_counts.keys()):
+                if 0 <= tag_idx < len(TAG_COLORS):
+                    name = TAG_COLORS[tag_idx][1]
+                else:
+                    name = f"Tag {tag_idx}"
+                parts.append(f"{name}:{tag_counts[tag_idx]}")
+            detail = " | ".join(parts)
+            self.annotation_count_label.setText(f"{total} 个标注 ({detail})")
+        else:
+            self.annotation_count_label.setText("0 个标注点")
+        self.fiji_ann_label.setText(str(total) if total > 0 else "--")
 
     def _build_imagej_roi_bytes(self, points):
         """Build ImageJ ROI binary data for point annotations."""
@@ -2792,13 +2896,20 @@ class MainWindow(QMainWindow):
 
     # ----- File handling -----
     def open_file(self):
-        filepath, _ = QFileDialog.getOpenFileName(
+        filepaths, _ = QFileDialog.getOpenFileNames(
             self, "打开图像文件", "", "显微镜图像 (*.czi *.tif *.tiff);;CZI 文件 (*.czi);;TIF 文件 (*.tif *.tiff);;所有文件 (*)"
         )
-        if filepath:
-            self._current_file = filepath
-            self.filename_label.setText(os.path.basename(filepath))
-            self.statusBar().showMessage(f"已选择: {filepath}")
+        if filepaths:
+            # Add all files to file list
+            for fp in filepaths:
+                if fp not in self._file_list:
+                    self._file_list.append(fp)
+            # Load the first selected file
+            self._current_file = filepaths[0]
+            self.filename_label.setText(os.path.basename(filepaths[0]))
+            self._file_index = self._file_list.index(filepaths[0])
+            self._update_nav_label()
+            self.statusBar().showMessage(f"已选择 {len(filepaths)} 个文件")
             self._preview_file()
 
     def run_analysis(self):
@@ -2836,8 +2947,10 @@ class MainWindow(QMainWindow):
         if applicable:
             names = [STRATEGIES[k]["name"] for k in applicable]
             self.strategy_label.setText(f"检测到策略: {' + '.join(names)}")
+            self.strategy_label.show()
         else:
-            self.strategy_label.setText("检测到策略: --")
+            self.strategy_label.setText("")
+            self.strategy_label.hide()
 
         # BUG 1: Update channel labels based on detected markers
         self._update_channel_labels(detected_markers)
@@ -2884,8 +2997,7 @@ class MainWindow(QMainWindow):
         strategy_results = result.get("strategy_results", [])
 
         if not strategy_results:
-            # Fallback: show legacy YAP+/AT2 results
-            self._insert_legacy_results(result, insert_idx)
+            # No strategies detected — don't show any strategy results
             return
 
         for sr in strategy_results:
@@ -3034,9 +3146,9 @@ class MainWindow(QMainWindow):
         for skey, btn in self._strategy_overlay_btns.items():
             strategy_show[skey] = btn.isChecked()
 
-        # Determine show_yap / show_at2 for legacy overlays
-        show_yap = strategy_show.get("__legacy_yap", self.show_yap_btn.isChecked() if hasattr(self, 'show_yap_btn') and self.show_yap_btn.isVisible() else False)
-        show_at2 = strategy_show.get("__legacy_at2", self.show_at2_btn.isChecked() if hasattr(self, 'show_at2_btn') and self.show_at2_btn.isVisible() else False)
+        # Legacy overlays only shown when legacy buttons are active in strategy_show
+        show_yap = strategy_show.get("__legacy_yap", False)
+        show_at2 = strategy_show.get("__legacy_at2", False)
 
         overlay = draw_overlays(
             composite,
@@ -3068,7 +3180,7 @@ class MainWindow(QMainWindow):
 
         h, w, _ = overlay.shape
         qimg = QImage(overlay.data.tobytes(), w, h, 3 * w, QImage.Format_RGB888)
-        self.viewer.set_pixmap(QPixmap.fromImage(qimg))
+        self.viewer.update_pixmap(QPixmap.fromImage(qimg))
 
     def _add_to_table(self, result):
         row = self.results_table.rowCount()
@@ -3199,8 +3311,13 @@ class MainWindow(QMainWindow):
                     seen.add(sr["key"])
                     all_strategy_keys.append(sr["key"])
 
+        # Determine if legacy columns are needed
+        has_legacy = any(not r.get("applicable_strategies") for r in self.batch_results)
+
         # Build dynamic header
-        header = ["Filename", "Total_Nuclei", "YAP_Positive", "YAP_Percent", "AT2_Cells", "AT2_Percent"]
+        header = ["Filename", "Total_Nuclei"]
+        if has_legacy:
+            header += ["YAP_Positive", "YAP_Percent", "AT2_Cells", "AT2_Percent"]
         strategy_col_map = {}  # key -> (count_col_name, pct_col_name)
         for skey in all_strategy_keys:
             strat = STRATEGIES.get(skey, {})
@@ -3220,11 +3337,14 @@ class MainWindow(QMainWindow):
                 row = [
                     r["filename"],
                     r["total_nuclei"],
-                    r["yap_count"],
-                    f"{r['yap_pct']:.1f}",
-                    r["at2_count"],
-                    f"{r['at2_pct']:.1f}",
                 ]
+                if has_legacy:
+                    row += [
+                        r["yap_count"],
+                        f"{r['yap_pct']:.1f}",
+                        r["at2_count"],
+                        f"{r['at2_pct']:.1f}",
+                    ]
                 # Build a lookup from strategy key to result
                 sr_lookup = {sr["key"]: sr for sr in r.get("strategy_results", [])}
                 for skey in all_strategy_keys:
@@ -3236,6 +3356,19 @@ class MainWindow(QMainWindow):
                         row.append("")
                 row.append(ann_count)
                 writer.writerow(row)
+
+            # Write threshold parameters
+            writer.writerow([])  # blank row
+            writer.writerow(["=== 分析参数 ==="])
+            params = self._get_params()
+            writer.writerow(["自动阈值(Otsu)", "是" if params["auto_thresh"] else "否"])
+            writer.writerow(["DAPI阈值", params["dapi_thresh"]])
+            writer.writerow(["红色通道阈值", params["red_thresh"]])
+            writer.writerow(["绿色通道阈值", params["green_thresh"]])
+            writer.writerow(["白色通道阈值", params["white_thresh"]])
+            writer.writerow(["环宽度", params["ring_width"]])
+            writer.writerow(["最小核面积", params["min_nucleus"]])
+
         self.statusBar().showMessage(f"已导出: {filepath}")
         QMessageBox.information(self, "导出成功", f"结果已保存至:\n{filepath}")
 
