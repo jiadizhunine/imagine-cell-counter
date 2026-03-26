@@ -1060,11 +1060,11 @@ def detect_markers_from_filename(filepath):
             markers[marker_name] = channel_color
 
     # Also detect standalone wavelengths for channel_map
-    if re.search(r'568', name_no_ext):
+    if re.search(r'\b568\b', name_no_ext):
         channel_map["red"] = 1
-    if re.search(r'647', name_no_ext):
+    if re.search(r'\b647\b', name_no_ext):
         channel_map["white"] = 0
-    if re.search(r'488', name_no_ext):
+    if re.search(r'\b488\b', name_no_ext):
         channel_map["green"] = 2
 
     # Default: if DAPI not found but other channels detected, assume DAPI exists
@@ -1663,8 +1663,8 @@ def segment_nuclei(dapi, auto_thresh, manual_thresh, min_size, max_size=5000):
                 tri = threshold_triangle(blurred)
             except Exception:
                 tri = otsu
-            # Take the lower of Otsu and triangle — better for dim nuclei
-            thresh = min(otsu, tri)
+            # Use Otsu threshold (triangle gives absurdly low values for DAPI)
+            thresh = otsu
         except ValueError:
             thresh = manual_thresh
     else:
@@ -1675,10 +1675,11 @@ def segment_nuclei(dapi, auto_thresh, manual_thresh, min_size, max_size=5000):
     from scipy.ndimage import binary_opening
     binary = binary_opening(binary, iterations=1)
     binary = binary_fill_holes(binary)
-    binary = remove_small_objects(binary, max_size=min_size)
+    binary = remove_small_objects(binary, min_size=min_size)
 
     if not binary.any():
-        return np.zeros_like(dapi, dtype=np.int32), 0
+        raw_equiv = int(thresh / blurred.max() * 255) if blurred.max() > 0 else 0
+        return np.zeros_like(dapi, dtype=np.int32), 0, raw_equiv
 
     dist = distance_transform_edt(binary)
     # local maxima as markers
@@ -1702,7 +1703,8 @@ def segment_nuclei(dapi, auto_thresh, manual_thresh, min_size, max_size=5000):
     remap[unique] = np.arange(1, len(unique) + 1)
     new_labels = remap[labels]
 
-    return new_labels, int(new_labels.max())
+    raw_equiv = int(thresh / blurred.max() * 255) if blurred.max() > 0 else 0
+    return new_labels, int(new_labels.max()), raw_equiv
 
 
 def count_yap(labels, red_channel, threshold):
@@ -1829,6 +1831,12 @@ def analyze_czi(filepath, params, progress_fn=None):
         elif role in auto_map:
             channel_map[role] = auto_map[role]
 
+    # Validate channel indices against actual data dimensions
+    n_channels = data.shape[0]
+    for role, idx in list(channel_map.items()):
+        if idx >= n_channels:
+            del channel_map[role]
+
     if "blue" not in channel_map:
         raise ValueError("DAPI (blue) channel not detected")
 
@@ -1836,7 +1844,7 @@ def analyze_czi(filepath, params, progress_fn=None):
 
     if progress_fn:
         progress_fn("Segmenting nuclei...")
-    labels, total = segment_nuclei(
+    labels, total, actual_dapi_thresh = segment_nuclei(
         dapi,
         params.get("auto_thresh", True),
         params.get("dapi_thresh", 128),
@@ -1939,14 +1947,18 @@ def analyze_czi(filepath, params, progress_fn=None):
                 params.get(marker_thresh_key, 15),
                 params.get(second_thresh_key, 15),
             )
-            # For double positive, percentage is relative to total nuclei
-            pct = (len(positive_labels) / total * 100) if total > 0 else 0
+            # Denominator = primary marker positive count (not total nuclei)
+            primary_positive = count_colocalized(
+                labels, data[channel_map[marker_ch]], params.get(marker_thresh_key, 15)
+            )
+            denominator = len(primary_positive)
+            pct = (len(positive_labels) / denominator * 100) if denominator > 0 else 0
             strategy_results.append({
                 "key": skey,
                 "name": strat["name"],
                 "desc": strat["desc"],
                 "positive_count": len(positive_labels),
-                "total": total,
+                "total": denominator,
                 "percentage": pct,
                 "positive_labels": positive_labels,
             })
@@ -1971,6 +1983,7 @@ def analyze_czi(filepath, params, progress_fn=None):
         "detected_markers": detected_markers,
         "applicable_strategies": applicable_strategies,
         "strategy_results": strategy_results,
+        "actual_dapi_thresh": actual_dapi_thresh,
     }
 
 
@@ -2643,10 +2656,11 @@ class MainWindow(QMainWindow):
     # ----- FEATURE 4: Dynamic overlay bar -----
     def _update_overlay_bar(self, strategies):
         """Rebuild overlay toggle buttons based on detected strategies."""
-        # Clear old strategy overlay buttons
-        for btn in self._strategy_overlay_btns.values():
+        # Clear old strategy overlay buttons (skip legacy buttons — they are reused)
+        for key, btn in self._strategy_overlay_btns.items():
             self._strategy_overlay_layout.removeWidget(btn)
-            btn.deleteLater()
+            if not key.startswith("__legacy_"):
+                btn.deleteLater()
         self._strategy_overlay_btns.clear()
 
         # Also remove legacy buttons from layout if they exist
@@ -2674,7 +2688,16 @@ class MainWindow(QMainWindow):
                 btn.clicked.connect(self._refresh_display)
                 self._strategy_overlay_layout.addWidget(btn)
                 self._strategy_overlay_btns[skey] = btn
-        # else: no strategies detected — don't show any overlay buttons
+        else:
+            # No strategies detected — show legacy YAP+/AT2 buttons
+            if hasattr(self, 'show_yap_btn'):
+                self.show_yap_btn.show()
+                self._strategy_overlay_layout.addWidget(self.show_yap_btn)
+                self._strategy_overlay_btns["__legacy_yap"] = self.show_yap_btn
+            if hasattr(self, 'show_at2_btn'):
+                self.show_at2_btn.show()
+                self._strategy_overlay_layout.addWidget(self.show_at2_btn)
+                self._strategy_overlay_btns["__legacy_at2"] = self.show_at2_btn
 
     # ----- FEATURE 5: Double-click table row to jump to file -----
     def _on_table_double_click(self, row, col):
@@ -2794,6 +2817,8 @@ class MainWindow(QMainWindow):
         """Jump to a specific file by index."""
         if idx < 0 or idx >= len(self._file_list):
             return
+        if self._current_file:
+            self._save_annotations_json(self._current_file)
         self._file_index = idx
         filepath = self._file_list[idx]
         self._current_file = filepath
@@ -2850,6 +2875,8 @@ class MainWindow(QMainWindow):
         """Navigate to previous file."""
         if not self._file_list or self._file_index <= 0:
             return
+        if self._current_file:
+            self._save_annotations_json(self._current_file)
         self._file_index -= 1
         filepath = self._file_list[self._file_index]
         self._current_file = filepath
@@ -2875,6 +2902,8 @@ class MainWindow(QMainWindow):
         """Navigate to next file."""
         if not self._file_list or self._file_index >= len(self._file_list) - 1:
             return
+        if self._current_file:
+            self._save_annotations_json(self._current_file)
         self._file_index += 1
         filepath = self._file_list[self._file_index]
         self._current_file = filepath
@@ -3137,6 +3166,23 @@ class MainWindow(QMainWindow):
         except Exception:
             return []
 
+    def _save_annotations_json(self, filepath):
+        """Save annotations to .annotations.json file."""
+        if not filepath:
+            return
+        points = self.viewer.get_annotations()
+        json_path = filepath + ".annotations.json"
+        try:
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump({"points": [list(p) for p in points]}, f)
+        except Exception:
+            pass
+
+    def closeEvent(self, event):
+        if self._current_file:
+            self._save_annotations_json(self._current_file)
+        event.accept()
+
     # ----- File handling -----
     def open_file(self):
         filepaths, _ = QFileDialog.getOpenFileNames(
@@ -3210,6 +3256,14 @@ class MainWindow(QMainWindow):
             f"分析完成: {result['filename']}  |  "
             f"{result['total_nuclei']} nuclei  |  {elapsed:.1f}s"
         )
+
+        # Show actual auto threshold on slider
+        actual_thresh_raw = result.get("actual_dapi_thresh")
+        if actual_thresh_raw is not None and self.auto_thresh_cb.isChecked():
+            self.dapi_slider.blockSignals(True)
+            self.dapi_slider.setValue(min(255, max(0, actual_thresh_raw)))
+            self.dapi_label.setText(str(actual_thresh_raw))
+            self.dapi_slider.blockSignals(False)
 
         # Update strategy label
         applicable = result.get("applicable_strategies", [])

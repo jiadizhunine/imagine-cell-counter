@@ -2,4 +2,5 @@ numpy
 scikit-image
 scipy
 czifile
+tifffile
 PyQt5
