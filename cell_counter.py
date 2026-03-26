@@ -1097,11 +1097,17 @@ def count_colocalized(labels, marker_data, threshold):
 
 
 def count_colocalized_filtered(labels, marker_data, threshold):
-    """Like count_colocalized but with median filtering to reduce noise.
+    """Nuclear marker detection with local background contrast.
 
-    HOPX is a nuclear transcription factor — signal is inside the nucleus.
-    Median filtering removes staining artifacts and floating color before
-    computing nuclear mean intensity.
+    For nuclear markers like HOPX, diffuse tissue autofluorescence can cause
+    false positives when the nucleus simply overlaps green tissue. To fix this,
+    we compare each nucleus's signal to its LOCAL background (the ring of
+    non-nuclear tissue around it). A true positive must satisfy BOTH:
+      1. Nuclear mean intensity >= threshold (absolute criterion)
+      2. Nuclear mean >= 1.5x local background (contrast criterion)
+
+    This eliminates false positives from diffuse autofluorescence while
+    keeping true signal where the nucleus is clearly brighter than surroundings.
     """
     from scipy.ndimage import median_filter
     n = labels.max()
@@ -1109,7 +1115,46 @@ def count_colocalized_filtered(labels, marker_data, threshold):
         return []
     filtered = median_filter(marker_data, size=3)
     means = ndimage.mean(filtered, labels, range(1, n + 1))
-    return [i + 1 for i, m in enumerate(means) if m >= threshold]
+
+    # Pre-filter: skip nuclei below absolute threshold
+    candidates = [i for i in range(n) if means[i] >= threshold]
+    if not candidates:
+        return []
+
+    # Compute local background for candidates
+    slices = ndimage.find_objects(labels)
+    bg_ring_width = 10
+    pad = bg_ring_width + 2
+    h, w = labels.shape
+    struct = ndimage.generate_binary_structure(2, 1)
+    contrast_ratio = 1.5  # nuclear signal must be >= 1.5x background
+
+    positives = []
+    for lbl_idx in candidates:
+        sl = slices[lbl_idx]
+        if sl is None:
+            continue
+        lbl = lbl_idx + 1
+        r0 = max(0, sl[0].start - pad)
+        r1 = min(h, sl[0].stop + pad)
+        c0 = max(0, sl[1].start - pad)
+        c1 = min(w, sl[1].stop + pad)
+        patch_labels = labels[r0:r1, c0:c1]
+        patch_mask = patch_labels == lbl
+        dilated = ndimage.binary_dilation(patch_mask, structure=struct, iterations=bg_ring_width)
+        # Background ring: dilated area excluding ALL nuclei (not just this one)
+        ring = dilated & (patch_labels == 0)
+        if ring.any():
+            bg_mean = filtered[r0:r1, c0:c1][ring].mean()
+        else:
+            bg_mean = 0
+
+        nuclear_mean = means[lbl_idx]
+        # True positive: above absolute threshold AND significantly above local background
+        if bg_mean < 1 or nuclear_mean / bg_mean >= contrast_ratio:
+            positives.append(lbl)
+
+    return positives
 
 
 def count_double_positive(labels, marker_data, second_data, marker_thresh, second_thresh):

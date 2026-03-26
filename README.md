@@ -41,7 +41,7 @@
 ## 界面预览
 
 <p align="center">
-  <img src="screenshot.png" alt="Imagine 界面预览" width="100%">
+  <img src="screenshot.jpg" alt="Imagine 界面预览" width="100%">
 </p>
 
 **深色主题 + 三栏布局**，自适应 16:9 屏幕比例：
