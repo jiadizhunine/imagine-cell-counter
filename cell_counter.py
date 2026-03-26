@@ -21,7 +21,8 @@ from PyQt5.QtWidgets import (
     QFileDialog, QProgressBar, QTableWidget, QTableWidgetItem,
     QMenuBar, QAction, QSplitter, QMessageBox, QHeaderView,
     QGridLayout, QScrollArea, QSizePolicy, QStatusBar, QFrame,
-    QGraphicsDropShadowEffect, QShortcut
+    QGraphicsDropShadowEffect, QShortcut, QMenu, QListWidget,
+    QListWidgetItem, QWidgetAction
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QPointF, QRectF, QSize
 from PyQt5.QtGui import (
@@ -972,6 +973,9 @@ MARKER_PATTERNS = [
     (re.compile(r'(?<![a-zA-Z])GFP(?![a-zA-Z])', re.IGNORECASE), "GFP", "488"),
 ]
 
+# Generic pattern: catches any marker-wavelength pair like CD45-568, CD31-488
+GENERIC_MARKER_RE = re.compile(r'\b([A-Za-z][A-Za-z0-9]*?)[-_](568|647|488)\b')
+
 STRATEGIES = {
     "AT2_number": {
         "name": "AT2 数量",
@@ -992,7 +996,7 @@ STRATEGIES = {
         "name": "AT1 数量",
         "desc": "HOPX+ 细胞计数",
         "requires": ["HOPX"],
-        "method": "count_colocalized",
+        "method": "count_at1",
         "marker_channel": "green",
     },
     "AT1_proliferation": {
@@ -1024,18 +1028,36 @@ TAG_COLORS = [
 
 
 def detect_markers_from_filename(filepath):
-    """Parse the filename to identify markers and channel mapping."""
+    """Parse the filename to identify markers and channel mapping.
+
+    First tries specific known patterns (Ki67, ProSPC, HOPX, aSMA, GFP),
+    then falls back to generic MARKER-WAVELENGTH patterns (e.g. CD45-568, CD31-488).
+    """
     basename = os.path.basename(filepath)
     name_no_ext = os.path.splitext(basename)[0]
 
     markers = {}
-    channel_map = {"blue": 3}  # DAPI always present
+    channel_map = {}
 
+    # Check if DAPI is mentioned in the filename
+    if re.search(r'\bDAPI\b', name_no_ext, re.IGNORECASE):
+        channel_map["blue"] = 3
+
+    # Try specific known patterns first
     for pattern, marker_name, wavelength in MARKER_PATTERNS:
         if pattern.search(name_no_ext):
             channel_color = WAVELENGTH_CHANNEL.get(wavelength)
             if channel_color:
                 markers[marker_name] = channel_color
+
+    # Generic fallback: detect any MARKER-WAVELENGTH patterns not already found
+    for match in GENERIC_MARKER_RE.finditer(name_no_ext):
+        marker_name = match.group(1)
+        wavelength = match.group(2)
+        channel_color = WAVELENGTH_CHANNEL.get(wavelength)
+        if channel_color and channel_color not in markers.values():
+            # Don't overwrite already-detected markers for this color
+            markers[marker_name] = channel_color
 
     # Also detect standalone wavelengths for channel_map
     if re.search(r'568', name_no_ext):
@@ -1044,6 +1066,10 @@ def detect_markers_from_filename(filepath):
         channel_map["white"] = 0
     if re.search(r'488', name_no_ext):
         channel_map["green"] = 2
+
+    # Default: if DAPI not found but other channels detected, assume DAPI exists
+    if "blue" not in channel_map:
+        channel_map["blue"] = 3
 
     return {
         "markers": markers,
@@ -1070,14 +1096,69 @@ def count_colocalized(labels, marker_data, threshold):
     return [i + 1 for i, m in enumerate(means) if m >= threshold]
 
 
-def count_double_positive(labels, marker_data, second_data, marker_thresh, second_thresh):
-    """For each nucleus, check if BOTH marker AND second channel signals are
-    above thresholds. Returns list of double-positive label IDs."""
+def count_at1(labels, marker_data, threshold, ring_width=8):
+    """Count AT1 cells using hybrid nuclear + perinuclear ring detection.
+
+    AT1 cells are flat squamous cells where HOPX signal extends beyond the
+    nucleus. We check BOTH nuclear interior AND a narrow perinuclear ring,
+    counting a cell as positive if either region exceeds the threshold.
+    Also applies median filtering to reduce noise from staining artifacts.
+    """
+    from scipy.ndimage import median_filter
     n = labels.max()
     if n == 0:
         return []
-    marker_means = ndimage.mean(marker_data, labels, range(1, n + 1))
-    second_means = ndimage.mean(second_data, labels, range(1, n + 1))
+
+    # Median filter to reduce noise/artifacts (3x3 kernel)
+    filtered = median_filter(marker_data, size=3)
+
+    # Nuclear means
+    nuclear_means = ndimage.mean(filtered, labels, range(1, n + 1))
+
+    # Ring-based detection (narrower ring than AT2)
+    slices = ndimage.find_objects(labels)
+    pad = ring_width + 2
+    h, w = labels.shape
+    struct = ndimage.generate_binary_structure(2, 1)
+    ring_means = np.zeros(n, dtype=np.float64)
+
+    for lbl_idx, sl in enumerate(slices):
+        if sl is None:
+            continue
+        r0 = max(0, sl[0].start - pad)
+        r1 = min(h, sl[0].stop + pad)
+        c0 = max(0, sl[1].start - pad)
+        c1 = min(w, sl[1].stop + pad)
+        patch_labels = labels[r0:r1, c0:c1]
+        patch_mask = patch_labels == (lbl_idx + 1)
+        dilated = ndimage.binary_dilation(patch_mask, structure=struct, iterations=ring_width)
+        ring = dilated & ~patch_mask
+        if ring.any():
+            ring_means[lbl_idx] = filtered[r0:r1, c0:c1][ring].mean()
+
+    # Positive if nuclear OR ring signal exceeds threshold
+    # Use a slightly lower threshold for the combined signal
+    positives = []
+    for i in range(n):
+        best = max(nuclear_means[i], ring_means[i])
+        if best >= threshold:
+            positives.append(i + 1)
+    return positives
+
+
+def count_double_positive(labels, marker_data, second_data, marker_thresh, second_thresh):
+    """For each nucleus, check if BOTH marker AND second channel signals are
+    above thresholds. Returns list of double-positive label IDs.
+    Applies median filtering to reduce noise from staining artifacts."""
+    from scipy.ndimage import median_filter
+    n = labels.max()
+    if n == 0:
+        return []
+    # Median filter both channels to reduce floating color / staining artifacts
+    marker_filtered = median_filter(marker_data, size=3)
+    second_filtered = median_filter(second_data, size=3)
+    marker_means = ndimage.mean(marker_filtered, labels, range(1, n + 1))
+    second_means = ndimage.mean(second_filtered, labels, range(1, n + 1))
     return [i + 1 for i, (mm, sm) in enumerate(zip(marker_means, second_means))
             if mm >= marker_thresh and sm >= second_thresh]
 
@@ -1786,6 +1867,29 @@ def analyze_czi(filepath, params, progress_fn=None):
                 "positive_labels": positive_labels,
             })
 
+        elif strat["method"] == "count_at1":
+            # AT1 hybrid nuclear + ring detection
+            if marker_ch == "red":
+                thresh_key = "red_thresh"
+            elif marker_ch == "white":
+                thresh_key = "white_thresh"
+            else:
+                thresh_key = "green_thresh"
+            positive_labels = count_at1(
+                labels, data[channel_map[marker_ch]], params.get(thresh_key, 15),
+                ring_width=max(5, params.get("ring_width", 15) // 2),
+            )
+            pct = (len(positive_labels) / total * 100) if total > 0 else 0
+            strategy_results.append({
+                "key": skey,
+                "name": strat["name"],
+                "desc": strat["desc"],
+                "positive_count": len(positive_labels),
+                "total": total,
+                "percentage": pct,
+                "positive_labels": positive_labels,
+            })
+
         elif strat["method"] == "count_double_positive":
             second_ch = strat.get("second_channel")
             if second_ch not in channel_map:
@@ -1873,7 +1977,15 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Imagine")
-        self.resize(1500, 950)
+        # Adaptive window size for 16:9 screens
+        screen = QApplication.primaryScreen()
+        if screen:
+            geom = screen.availableGeometry()
+            w = min(int(geom.width() * 0.88), 1600)
+            h = min(int(geom.height() * 0.88), 900)
+            self.resize(w, h)
+        else:
+            self.resize(1600, 900)
 
         # Set window icon from embedded logo
         icon = _load_logo_icon()
@@ -1895,7 +2007,6 @@ class MainWindow(QMainWindow):
 
         # Keyboard shortcuts
         QShortcut(QKeySequence("Ctrl+Z"), self, activated=lambda: self.viewer.undo())
-        QShortcut(QKeySequence("Ctrl+S"), self, activated=self.export_as_tif)
         QShortcut(QKeySequence("Left"), self, activated=self._nav_prev)
         QShortcut(QKeySequence("Right"), self, activated=self._nav_next)
 
@@ -1923,6 +2034,12 @@ class MainWindow(QMainWindow):
         act_export.setToolTip("导出结果到 CSV (Ctrl+E)")
         act_export.triggered.connect(self.export_csv)
         file_menu.addAction(act_export)
+
+        act_export_tif = QAction("导出标注 TIF (&T)", self)
+        act_export_tif.setShortcut("Ctrl+S")
+        act_export_tif.setToolTip("导出当前图像+标注为 Fiji 兼容 TIF (Ctrl+S)")
+        act_export_tif.triggered.connect(self.export_as_tif)
+        file_menu.addAction(act_export_tif)
 
         file_menu.addSeparator()
 
@@ -1976,9 +2093,13 @@ class MainWindow(QMainWindow):
         self._nav_prev_btn.setToolTip("上一张图片 (左方向键)")
         title_bar_layout.addWidget(self._nav_prev_btn)
 
-        self._nav_pos_label = QLabel("0 / 0")
-        self._nav_pos_label.setStyleSheet("color: #8899bb; font-size: 13px; padding: 0 6px;")
-        title_bar_layout.addWidget(self._nav_pos_label)
+        # Clickable file list button (replaces plain label)
+        self._nav_pos_btn = QPushButton("0 / 0")
+        self._nav_pos_btn.setObjectName("toggleBtn")
+        self._nav_pos_btn.setFixedWidth(80)
+        self._nav_pos_btn.setToolTip("点击查看文件列表")
+        self._nav_pos_btn.clicked.connect(self._show_file_list_popup)
+        title_bar_layout.addWidget(self._nav_pos_btn)
 
         self._nav_next_btn = QPushButton("下一张 >")
         self._nav_next_btn.setObjectName("toggleBtn")
@@ -2254,53 +2375,6 @@ class MainWindow(QMainWindow):
         self._strategy_overlay_layout.addWidget(self.show_at2_btn)
         toggle_layout.addWidget(self._strategy_overlay_container)
 
-        # Annotation separator
-        ann_sep = QFrame()
-        ann_sep.setFrameShape(QFrame.VLine)
-        ann_sep.setStyleSheet("color: #2a3a5c;")
-        toggle_layout.addWidget(ann_sep)
-
-        toggle_layout.addWidget(QLabel("标注:"))
-
-        self.annotation_mode_btn = QPushButton("手动标注")
-        self.annotation_mode_btn.setObjectName("toggleBtn")
-        self.annotation_mode_btn.setCheckable(True)
-        self.annotation_mode_btn.setChecked(False)
-        self.annotation_mode_btn.setStyleSheet(
-            "QPushButton { color: #FFD700; border: 1px solid #FFD700; }"
-            "QPushButton:checked { background-color: #FFD700; color: #1a1a2e; }"
-        )
-        self.annotation_mode_btn.clicked.connect(self._toggle_annotation_mode)
-        toggle_layout.addWidget(self.annotation_mode_btn)
-
-        self.tag_combo = QComboBox()
-        for i, (color, name) in enumerate(TAG_COLORS):
-            self.tag_combo.addItem(f"{name}")
-        self.tag_combo.setFixedWidth(90)
-        self.tag_combo.setToolTip("选择标注颜色标签")
-        self.tag_combo.currentIndexChanged.connect(self._on_tag_changed)
-        toggle_layout.addWidget(self.tag_combo)
-
-        self.clear_annotations_btn = QPushButton("清除标注")
-        self.clear_annotations_btn.setObjectName("toggleBtn")
-        self.clear_annotations_btn.setStyleSheet(
-            "QPushButton { color: #FFD700; border: 1px solid #FFD700; }"
-        )
-        self.clear_annotations_btn.clicked.connect(self._clear_annotations)
-        toggle_layout.addWidget(self.clear_annotations_btn)
-
-        self.export_annotations_btn = QPushButton("导出 TIF")
-        self.export_annotations_btn.setObjectName("toggleBtn")
-        self.export_annotations_btn.setStyleSheet(
-            "QPushButton { color: #FFD700; border: 1px solid #FFD700; }"
-        )
-        self.export_annotations_btn.clicked.connect(self.export_as_tif)
-        toggle_layout.addWidget(self.export_annotations_btn)
-
-        self.annotation_count_label = QLabel("0 个标注点")
-        self.annotation_count_label.setStyleSheet("color: #FFD700; font-size: 13px;")
-        toggle_layout.addWidget(self.annotation_count_label)
-
         toggle_layout.addStretch()
         center_layout.addWidget(toggle_frame)
 
@@ -2321,6 +2395,49 @@ class MainWindow(QMainWindow):
         self.zoom_label.setAlignment(Qt.AlignRight)
         self.viewer.zoom_changed.connect(lambda z: self.zoom_label.setText(f"缩放: {z*100:.0f}%"))
         center_layout.addWidget(self.zoom_label)
+
+        # === Annotation bar (bottom of center panel) ===
+        ann_bar = QFrame()
+        ann_bar.setObjectName("toggleBar")
+        ann_bar_layout = QHBoxLayout(ann_bar)
+        ann_bar_layout.setContentsMargins(8, 4, 8, 4)
+        ann_bar_layout.setSpacing(6)
+
+        ann_bar_layout.addWidget(QLabel("标注:"))
+
+        self.annotation_mode_btn = QPushButton("手动标注")
+        self.annotation_mode_btn.setObjectName("toggleBtn")
+        self.annotation_mode_btn.setCheckable(True)
+        self.annotation_mode_btn.setChecked(False)
+        self.annotation_mode_btn.setStyleSheet(
+            "QPushButton { color: #FFD700; border: 1px solid #FFD700; }"
+            "QPushButton:checked { background-color: #FFD700; color: #1a1a2e; }"
+        )
+        self.annotation_mode_btn.clicked.connect(self._toggle_annotation_mode)
+        ann_bar_layout.addWidget(self.annotation_mode_btn)
+
+        self.tag_combo = QComboBox()
+        for i, (color, name) in enumerate(TAG_COLORS):
+            self.tag_combo.addItem(f"{name}")
+        self.tag_combo.setFixedWidth(90)
+        self.tag_combo.setToolTip("选择标注颜色标签")
+        self.tag_combo.currentIndexChanged.connect(self._on_tag_changed)
+        ann_bar_layout.addWidget(self.tag_combo)
+
+        self.clear_annotations_btn = QPushButton("清除标注")
+        self.clear_annotations_btn.setObjectName("toggleBtn")
+        self.clear_annotations_btn.setStyleSheet(
+            "QPushButton { color: #FFD700; border: 1px solid #FFD700; }"
+        )
+        self.clear_annotations_btn.clicked.connect(self._clear_annotations)
+        ann_bar_layout.addWidget(self.clear_annotations_btn)
+
+        self.annotation_count_label = QLabel("0 个标注点")
+        self.annotation_count_label.setStyleSheet("color: #FFD700; font-size: 13px;")
+        ann_bar_layout.addWidget(self.annotation_count_label)
+
+        ann_bar_layout.addStretch()
+        center_layout.addWidget(ann_bar)
 
         body_layout.addWidget(center_widget, stretch=1)
 
@@ -2599,9 +2716,98 @@ class MainWindow(QMainWindow):
         """Update the navigation position label."""
         total = len(self._file_list)
         if total == 0:
-            self._nav_pos_label.setText("0 / 0")
+            self._nav_pos_btn.setText("0 / 0")
         else:
-            self._nav_pos_label.setText(f"{self._file_index + 1} / {total}")
+            self._nav_pos_btn.setText(f"{self._file_index + 1} / {total}")
+
+    def _show_file_list_popup(self):
+        """Show a popup list of all loaded files. Click to navigate, right-click to remove."""
+        if not self._file_list:
+            return
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background-color: #16213e; color: #e0e0e0; border: 1px solid #2a3a5c; "
+            "border-radius: 6px; padding: 4px; min-width: 300px; }"
+            "QMenu::item { padding: 6px 16px; border-radius: 4px; }"
+            "QMenu::item:selected { background-color: #2a3a5c; color: #e8985a; }"
+        )
+        for i, fp in enumerate(self._file_list):
+            name = os.path.basename(fp)
+            prefix = "▶ " if i == self._file_index else "   "
+            action = menu.addAction(f"{prefix}{i+1}. {name}")
+            action.setData(i)
+
+        menu.addSeparator()
+        close_action = menu.addAction("关闭当前文件")
+        close_all_action = menu.addAction("关闭所有文件")
+
+        action = menu.exec_(self._nav_pos_btn.mapToGlobal(
+            self._nav_pos_btn.rect().bottomLeft()))
+        if action is None:
+            return
+        if action == close_action:
+            self._close_current_file()
+        elif action == close_all_action:
+            self._close_all_files()
+        elif action.data() is not None:
+            idx = action.data()
+            self._jump_to_file(idx)
+
+    def _jump_to_file(self, idx):
+        """Jump to a specific file by index."""
+        if idx < 0 or idx >= len(self._file_list):
+            return
+        self._file_index = idx
+        filepath = self._file_list[idx]
+        self._current_file = filepath
+        self.filename_label.setText(os.path.basename(filepath))
+        self._update_nav_label()
+
+        cached = self._batch_results_by_path.get(filepath)
+        if cached and "data" in cached and "labels" in cached:
+            self.current_result = cached
+            self._update_results_display(cached)
+            detected_markers = cached.get("detected_markers", {})
+            applicable = cached.get("applicable_strategies", [])
+            self._update_channel_labels(detected_markers)
+            self._update_sidebar_for_strategy(detected_markers, applicable)
+            self._update_overlay_bar(applicable)
+            self._refresh_display()
+        else:
+            self.current_result = None
+            self._preview_file()
+
+    def _close_current_file(self):
+        """Remove the current file from the file list."""
+        if not self._file_list:
+            return
+        removed_path = self._file_list.pop(self._file_index)
+        if removed_path in self._batch_results_by_path:
+            del self._batch_results_by_path[removed_path]
+
+        if not self._file_list:
+            self._file_index = 0
+            self._current_file = None
+            self.filename_label.setText("未加载文件")
+            self.viewer.set_pixmap(QPixmap())
+            self.current_result = None
+            self.total_label.setText("--")
+        else:
+            self._file_index = min(self._file_index, len(self._file_list) - 1)
+            self._jump_to_file(self._file_index)
+        self._update_nav_label()
+
+    def _close_all_files(self):
+        """Remove all files from the file list."""
+        self._file_list.clear()
+        self._batch_results_by_path.clear()
+        self._file_index = 0
+        self._current_file = None
+        self.filename_label.setText("未加载文件")
+        self.viewer.set_pixmap(QPixmap())
+        self.current_result = None
+        self.total_label.setText("--")
+        self._update_nav_label()
 
     def _nav_prev(self):
         """Navigate to previous file."""
