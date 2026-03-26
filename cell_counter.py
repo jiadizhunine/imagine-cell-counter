@@ -1097,37 +1097,50 @@ def count_colocalized(labels, marker_data, threshold):
 
 
 def count_colocalized_filtered(labels, marker_data, threshold):
-    """Nuclear marker detection with local background contrast.
+    """Nuclear marker detection with background subtraction + local contrast.
 
-    For nuclear markers like HOPX, diffuse tissue autofluorescence can cause
-    false positives when the nucleus simply overlaps green tissue. To fix this,
-    we compare each nucleus's signal to its LOCAL background (the ring of
-    non-nuclear tissue around it). A true positive must satisfy BOTH:
-      1. Nuclear mean intensity >= threshold (absolute criterion)
-      2. Nuclear mean >= 1.5x local background (contrast criterion)
+    For nuclear markers like HOPX, diffuse tissue autofluorescence causes
+    false positives. Two-stage approach:
 
-    This eliminates false positives from diffuse autofluorescence while
-    keeping true signal where the nucleus is clearly brighter than surroundings.
+    Stage 1 — Morphological reconstruction background subtraction:
+      Estimates the large-scale background (autofluorescence, tissue) and
+      removes it. In images with NO real signal, corrected values are ~0
+      and nothing passes the threshold → eliminates bulk false positives.
+
+    Stage 2 — Local ring contrast check:
+      Among candidates that pass Stage 1, verify that the corrected nuclear
+      signal is significantly higher than the corrected ring background.
+      This catches remaining false positives where local tissue overlap
+      survived the global background subtraction.
+
+    The user's threshold slider controls the corrected signal cutoff.
     """
     from scipy.ndimage import median_filter
+    from skimage.morphology import disk, reconstruction, erosion as morph_erosion
+
     n = labels.max()
     if n == 0:
         return []
-    filtered = median_filter(marker_data, size=3)
-    means = ndimage.mean(filtered, labels, range(1, n + 1))
 
-    # Pre-filter: skip nuclei below absolute threshold
+    # Stage 1: Background subtraction via morphological reconstruction
+    marker_f64 = marker_data.astype(np.float64)
+    seed = morph_erosion(marker_f64, disk(12))
+    background = reconstruction(seed, marker_f64, method='dilation')
+    corrected = np.clip(marker_f64 - background, 0, None)
+    filtered = median_filter(corrected, size=3)
+
+    means = ndimage.mean(filtered, labels, range(1, n + 1))
     candidates = [i for i in range(n) if means[i] >= threshold]
     if not candidates:
         return []
 
-    # Compute local background for candidates
+    # Stage 2: Local ring contrast on corrected image
     slices = ndimage.find_objects(labels)
-    bg_ring_width = 10
-    pad = bg_ring_width + 2
     h, w = labels.shape
     struct = ndimage.generate_binary_structure(2, 1)
-    contrast_ratio = 1.5  # nuclear signal must be >= 1.5x background
+    ring_width = 10
+    pad = ring_width + 2
+    contrast_ratio = 1.5
 
     positives = []
     for lbl_idx in candidates:
@@ -1140,9 +1153,8 @@ def count_colocalized_filtered(labels, marker_data, threshold):
         c0 = max(0, sl[1].start - pad)
         c1 = min(w, sl[1].stop + pad)
         patch_labels = labels[r0:r1, c0:c1]
-        patch_mask = patch_labels == lbl
-        dilated = ndimage.binary_dilation(patch_mask, structure=struct, iterations=bg_ring_width)
-        # Background ring: dilated area excluding ALL nuclei (not just this one)
+        dilated = ndimage.binary_dilation(
+            patch_labels == lbl, structure=struct, iterations=ring_width)
         ring = dilated & (patch_labels == 0)
         if ring.any():
             bg_mean = filtered[r0:r1, c0:c1][ring].mean()
@@ -1150,7 +1162,6 @@ def count_colocalized_filtered(labels, marker_data, threshold):
             bg_mean = 0
 
         nuclear_mean = means[lbl_idx]
-        # True positive: above absolute threshold AND significantly above local background
         if bg_mean < 1 or nuclear_mean / bg_mean >= contrast_ratio:
             positives.append(lbl)
 
