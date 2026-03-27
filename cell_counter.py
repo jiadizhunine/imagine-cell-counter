@@ -996,14 +996,14 @@ STRATEGIES = {
         "name": "AT1 数量",
         "desc": "HOPX+ 细胞计数",
         "requires": ["HOPX"],
-        "method": "count_colocalized_filtered",
+        "method": "count_at1",
         "marker_channel": "green",
     },
     "AT1_proliferation": {
         "name": "AT1 增殖",
         "desc": "HOPX+Ki67+ / HOPX+",
         "requires": ["HOPX", "Ki67"],
-        "method": "count_double_positive",
+        "method": "count_at1_proliferation",
         "marker_channel": "green",
         "second_channel": "red",
     },
@@ -1171,6 +1171,204 @@ def count_colocalized_filtered(labels, marker_data, threshold):
             positives.append(lbl)
 
     return positives
+
+
+def count_at1_cells(labels, hopx_data, threshold, dapi=None):
+    """Specialized AT1+ cell counting with HOPX-assisted nuclear refinement.
+
+    AT1 cells have nuclear HOPX signal. Standard detection has issues:
+    1. Adjacent AT1 cells sometimes merge into one nucleus in DAPI segmentation
+    2. Some AT1 nuclei are DAPI-faint and missed by segmentation
+    3. Immune cells have cytoplasmic (ring-pattern) HOPX → false positives
+
+    This function:
+    - Splits large HOPX+ nuclei containing multiple HOPX peaks
+    - Recovers strong HOPX spots not covered by DAPI nuclei
+    - Uses ring contrast filtering (1.8×) to reject cytoplasmic HOPX
+
+    Returns (refined_labels, positive_label_list, total_refined_nuclei)
+    """
+    from scipy.ndimage import median_filter
+    from skimage.morphology import disk, reconstruction, erosion as morph_erosion
+    from skimage.feature import peak_local_max
+
+    h, w = labels.shape
+    refined = labels.copy()
+    next_label = int(labels.max()) + 1
+    hopx_filtered = median_filter(hopx_data, size=3)
+    hopx_blurred = gaussian(hopx_data.astype(np.float64), sigma=2)
+
+    # ---- Phase 1: Split large HOPX+ nuclei with multiple peaks ----
+    areas = np.bincount(refined.ravel())
+    slices = ndimage.find_objects(refined)
+    n_orig = int(refined.max())
+
+    for lbl_idx in range(n_orig):
+        sl = slices[lbl_idx]
+        if sl is None:
+            continue
+        lbl = lbl_idx + 1
+        if lbl >= len(areas) or areas[lbl] < 400:
+            continue
+
+        # Only split nuclei that are clearly HOPX+ (well above threshold)
+        mask_full = (refined == lbl)
+        nuc_hopx_mean = hopx_filtered[mask_full].mean()
+        if nuc_hopx_mean < max(threshold, 20):
+            continue
+
+        # Extract local patch with padding
+        pad = 3
+        r0 = max(0, sl[0].start - pad)
+        r1 = min(h, sl[0].stop + pad)
+        c0 = max(0, sl[1].start - pad)
+        c1 = min(w, sl[1].stop + pad)
+
+        patch_mask = refined[r0:r1, c0:c1] == lbl
+        hopx_patch = hopx_blurred[r0:r1, c0:c1].copy()
+        hopx_patch[~patch_mask] = 0
+
+        # Find HOPX peaks within this nucleus
+        peaks = peak_local_max(hopx_patch, min_distance=5,
+                               threshold_abs=max(threshold, 15),
+                               labels=patch_mask.astype(int))
+
+        if len(peaks) < 2:
+            continue
+
+        # Re-segment using HOPX-guided watershed
+        markers_ws = np.zeros_like(patch_mask, dtype=np.int32)
+        for pi, (py, px) in enumerate(peaks):
+            markers_ws[py, px] = pi + 1
+        sub_labels = watershed(-hopx_patch, markers_ws, mask=patch_mask)
+
+        # Only accept split if all sub-regions are of reasonable size
+        sub_areas = []
+        for sv in range(1, sub_labels.max() + 1):
+            sub_areas.append((sub_labels == sv).sum())
+        if min(sub_areas) < 60:
+            continue  # Sub-region too small — likely noise peak, skip split
+
+        # Clear and reassign
+        refined[r0:r1, c0:c1][patch_mask] = 0
+        first = True
+        for sv in range(1, sub_labels.max() + 1):
+            sub_mask = sub_labels == sv
+            if first:
+                refined[r0:r1, c0:c1][sub_mask] = lbl
+                first = False
+            else:
+                refined[r0:r1, c0:c1][sub_mask] = next_label
+                next_label += 1
+
+    # ---- Phase 2: Recover HOPX-bright nuclei missed by DAPI (very conservative) ----
+    # Only recover strong, isolated HOPX peaks with nearby DAPI evidence.
+    # Handles rare AT1 cells with very faint DAPI but strong nuclear HOPX.
+    if dapi is not None:
+        hopx_peaks_p2 = peak_local_max(hopx_blurred, min_distance=10, threshold_abs=50)
+        n_recovered = 0
+        for py, px in hopx_peaks_p2:
+            if n_recovered >= 10:
+                break
+            if refined[py, px] > 0:
+                continue
+            # Must have NO nucleus within 8px (truly isolated)
+            has_nearby = False
+            for dy in range(-8, 9):
+                for dx in range(-8, 9):
+                    ny, nx = py + dy, px + dx
+                    if 0 <= ny < h and 0 <= nx < w and refined[ny, nx] > 0:
+                        has_nearby = True
+                        break
+                if has_nearby:
+                    break
+            if has_nearby:
+                continue
+            # Must have DAPI > 2 within 10px (confirms real cell location)
+            y0, y1 = max(0, py - 10), min(h, py + 11)
+            x0, x1 = max(0, px - 10), min(w, px + 11)
+            if dapi[y0:y1, x0:x1].max() < 2:
+                continue
+            # Very strong local HOPX required
+            y0, y1 = max(0, py - 4), min(h, py + 5)
+            x0, x1 = max(0, px - 4), min(w, px + 5)
+            if hopx_data[y0:y1, x0:x1].mean() < 35:
+                continue
+            # Build small nucleus
+            y0, y1 = max(0, py - 8), min(h, py + 9)
+            x0, x1 = max(0, px - 8), min(w, px + 9)
+            local_hopx = hopx_blurred[y0:y1, x0:x1]
+            local_mask = local_hopx > max(local_hopx.max() * 0.45, 20)
+            local_mask &= (refined[y0:y1, x0:x1] == 0)
+            area = local_mask.sum()
+            if 25 <= area <= 400:
+                refined[y0:y1, x0:x1][local_mask] = next_label
+                next_label += 1
+                n_recovered += 1
+
+    # ---- Relabel contiguously ----
+    unique = np.unique(refined)
+    unique = unique[unique > 0]
+    if len(unique) == 0:
+        return refined, [], 0
+    remap = np.zeros(int(refined.max()) + 1, dtype=np.int32)
+    remap[unique] = np.arange(1, len(unique) + 1)
+    refined = remap[refined]
+    n_total = int(refined.max())
+
+    # ---- Phase 3: HOPX+ detection with improved ring contrast ----
+    n = refined.max()
+    if n == 0:
+        return refined, [], 0
+
+    raw_means = ndimage.mean(hopx_filtered, refined, range(1, n + 1))
+
+    # Gate 1: HOPX threshold
+    candidates = [i for i in range(n) if raw_means[i] >= threshold]
+    if not candidates:
+        return refined, [], n_total
+
+    # Gate 2: Morphological reconstruction background floor
+    marker_f64 = hopx_data.astype(np.float64)
+    seed = morph_erosion(marker_f64, disk(12))
+    background = reconstruction(seed, marker_f64, method='dilation')
+    corrected = np.clip(marker_f64 - background, 0, None)
+    corr_filtered = median_filter(corrected, size=3)
+    corr_means = ndimage.mean(corr_filtered, refined, range(1, n + 1))
+    corr_floor = 2.0
+    candidates = [i for i in candidates if corr_means[i] >= corr_floor]
+    if not candidates:
+        return refined, [], n_total
+
+    # Gate 3: Ring contrast (1.8× — rejects cytoplasmic HOPX in immune cells)
+    slices_r = ndimage.find_objects(refined)
+    struct = ndimage.generate_binary_structure(2, 1)
+    ring_width = 10
+    pad = ring_width + 2
+    contrast_ratio = 1.8
+
+    positives = []
+    for lbl_idx in candidates:
+        sl = slices_r[lbl_idx]
+        if sl is None:
+            continue
+        lbl = lbl_idx + 1
+        r0 = max(0, sl[0].start - pad)
+        r1 = min(h, sl[0].stop + pad)
+        c0 = max(0, sl[1].start - pad)
+        c1 = min(w, sl[1].stop + pad)
+        patch_labels = refined[r0:r1, c0:c1]
+        dilated = ndimage.binary_dilation(
+            patch_labels == lbl, structure=struct, iterations=ring_width)
+        ring = dilated & (patch_labels == 0)
+        if ring.any():
+            bg_mean = hopx_filtered[r0:r1, c0:c1][ring].mean()
+        else:
+            bg_mean = 0
+        if bg_mean < 1 or raw_means[lbl_idx] / bg_mean >= contrast_ratio:
+            positives.append(lbl)
+
+    return refined, positives, n_total
 
 
 def count_double_positive(labels, marker_data, second_data, marker_thresh, second_thresh):
@@ -1652,7 +1850,7 @@ def detect_channels(meta_xml, filepath=None):
 
 def segment_nuclei(dapi, auto_thresh, manual_thresh, min_size, max_size=5000):
     """Segment nuclei from DAPI channel. Returns labelled array."""
-    blurred = gaussian(dapi.astype(np.float64), sigma=3)
+    blurred = gaussian(dapi.astype(np.float64), sigma=2)
 
     if auto_thresh:
         try:
@@ -1961,6 +2159,62 @@ def analyze_czi(filepath, params, progress_fn=None):
                 "total": denominator,
                 "percentage": pct,
                 "positive_labels": positive_labels,
+            })
+
+        elif strat["method"] == "count_at1":
+            # AT1 counting with HOPX-assisted nuclear refinement
+            thresh_key = "green_thresh"
+            refined_labels, positive_labels, n_refined = count_at1_cells(
+                labels, data[channel_map[marker_ch]], params.get(thresh_key, 15),
+                dapi=dapi,
+            )
+            pct = (len(positive_labels) / n_refined * 100) if n_refined > 0 else 0
+            # Store refined labels for AT1 proliferation reuse
+            at1_refined_labels = refined_labels
+            at1_n_refined = n_refined
+            strategy_results.append({
+                "key": skey,
+                "name": strat["name"],
+                "desc": strat["desc"],
+                "positive_count": len(positive_labels),
+                "total": n_refined,
+                "percentage": pct,
+                "positive_labels": positive_labels,
+                "refined_labels": refined_labels,
+            })
+
+        elif strat["method"] == "count_at1_proliferation":
+            # AT1 proliferation: HOPX+Ki67+ / HOPX+ using refined labels
+            second_ch = strat.get("second_channel")
+            if second_ch not in channel_map:
+                continue
+            # Use AT1-refined labels if available
+            use_labels = at1_refined_labels if 'at1_refined_labels' in dir() else labels
+            use_n = at1_n_refined if 'at1_n_refined' in dir() else total
+            marker_thresh_key = "green_thresh"
+            second_thresh_key = "red_thresh"
+            positive_labels = count_double_positive(
+                use_labels,
+                data[channel_map[marker_ch]],
+                data[channel_map[second_ch]],
+                params.get(marker_thresh_key, 15),
+                params.get(second_thresh_key, 15),
+            )
+            # Denominator = HOPX+ count from AT1 refined labels
+            hopx_positive = count_colocalized(
+                use_labels, data[channel_map[marker_ch]], params.get(marker_thresh_key, 15)
+            )
+            denominator = len(hopx_positive)
+            pct = (len(positive_labels) / denominator * 100) if denominator > 0 else 0
+            strategy_results.append({
+                "key": skey,
+                "name": strat["name"],
+                "desc": strat["desc"],
+                "positive_count": len(positive_labels),
+                "total": denominator,
+                "percentage": pct,
+                "positive_labels": positive_labels,
+                "refined_labels": use_labels if use_labels is not labels else None,
             })
 
     elapsed = time.time() - t0
@@ -3499,7 +3753,11 @@ class MainWindow(QMainWindow):
             # Parse hex color to RGB
             c = color.lstrip("#")
             rgb = [int(c[i:i+2], 16) for i in (0, 2, 4)]
-            mask = np.isin(r["labels"], positive_labels)
+            # Use refined labels if available (AT1 strategies)
+            overlay_labels = sr.get("refined_labels")
+            if overlay_labels is None:
+                overlay_labels = r["labels"]
+            mask = np.isin(overlay_labels, positive_labels)
             contour = mask & ~binary_erosion(mask, iterations=1)
             overlay[contour] = rgb
 
@@ -3532,7 +3790,7 @@ class MainWindow(QMainWindow):
         # Strip positive_labels from strategy_results to save memory
         if "strategy_results" in export_result:
             export_result["strategy_results"] = [
-                {k: v for k, v in sr.items() if k != "positive_labels"}
+                {k: v for k, v in sr.items() if k not in ("positive_labels", "refined_labels")}
                 for sr in export_result["strategy_results"]
             ]
         self.batch_results.append(export_result)
