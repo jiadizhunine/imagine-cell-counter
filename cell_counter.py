@@ -11,8 +11,45 @@ import json
 import time
 import base64
 import struct
+import traceback
+import logging
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from datetime import datetime
+
+
+# ---------------------------------------------------------------------------
+# Crash log setup — writes to crash_log.txt next to the executable
+# ---------------------------------------------------------------------------
+def _get_log_path():
+    """Return path for crash log, next to exe or script."""
+    if getattr(sys, 'frozen', False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "crash_log.txt")
+
+
+def _setup_crash_logging():
+    """Configure file-based crash logging."""
+    log_path = _get_log_path()
+    logging.basicConfig(
+        filename=log_path,
+        level=logging.ERROR,
+        format="%(asctime)s  %(levelname)s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+
+def _excepthook(exc_type, exc_value, exc_tb):
+    """Global exception handler — log unhandled exceptions to crash_log.txt."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+    tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    logging.error("Unhandled exception:\n%s", tb_text)
+    # Also print to stderr for development
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
 
 import numpy as np
 from PyQt5.QtWidgets import (
@@ -3433,8 +3470,20 @@ class MainWindow(QMainWindow):
             pass
 
     def closeEvent(self, event):
-        if self._current_file:
-            self._save_annotations_json(self._current_file)
+        try:
+            if self._current_file:
+                self._save_annotations_json(self._current_file)
+        except Exception:
+            logging.error("Error saving annotations on exit:\n%s", traceback.format_exc())
+
+        # Gracefully stop worker threads to prevent white-screen hang on exit
+        for worker in (self.worker, self.batch_worker):
+            if worker is not None and worker.isRunning():
+                worker.quit()
+                if not worker.wait(2000):  # 2s timeout
+                    worker.terminate()
+                    worker.wait(1000)
+
         event.accept()
 
     # ----- File handling -----
@@ -3958,18 +4007,30 @@ class MainWindow(QMainWindow):
 
 
 def main():
-    app = QApplication(sys.argv)
-    app.setStyle("Fusion")
-    app.setStyleSheet(DARK_STYLESHEET)
+    # Install crash logging before anything else
+    _setup_crash_logging()
+    sys.excepthook = _excepthook
 
-    # Set application icon
-    icon = _load_logo_icon()
-    if not icon.isNull():
-        app.setWindowIcon(icon)
+    try:
+        app = QApplication(sys.argv)
+        app.setStyle("Fusion")
+        app.setStyleSheet(DARK_STYLESHEET)
 
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec_())
+        # Set application icon
+        icon = _load_logo_icon()
+        if not icon.isNull():
+            app.setWindowIcon(icon)
+
+        window = MainWindow()
+        window.show()
+        exit_code = app.exec_()
+    except Exception:
+        logging.error("Fatal error during startup or execution:\n%s", traceback.format_exc())
+        raise
+    finally:
+        logging.shutdown()
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
