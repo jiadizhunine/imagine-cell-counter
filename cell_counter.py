@@ -992,10 +992,24 @@ CHANNEL_LABELS = {
     "white": "White (proSPC-647)",
 }
 
+# Extended role/color system for up to 8 channels
+ROLE_OPTIONS = ["none", "blue", "red", "green", "white", "cyan", "magenta", "yellow", "orange"]
+ROLE_OPTIONS_CN = ["不分配", "蓝色(DAPI)", "红色", "绿色", "白色", "青色", "品红", "黄色", "橙色"]
+DISPLAY_COLORS_HEX = {
+    "blue": "#60a5fa", "red": "#f87171", "green": "#4ade80", "white": "#e0e0e0",
+    "cyan": "#22d3ee", "magenta": "#e879f9", "yellow": "#facc15", "orange": "#fb923c",
+    "none": "#555555",
+}
+COMPOSITE_RGB = {
+    "blue": (0, 0, 1), "red": (1, 0, 0), "green": (0, 1, 0), "white": (0.7, 0.7, 0.7),
+    "cyan": (0, 1, 1), "magenta": (1, 0, 1), "yellow": (1, 1, 0), "orange": (1, 0.5, 0),
+}
+
 # ---------------------------------------------------------------------------
 # Wavelength-to-channel and marker-to-wavelength patterns
 # ---------------------------------------------------------------------------
 WAVELENGTH_CHANNEL = {
+    "567": "red",
     "568": "red",
     "647": "white",
     "488": "green",
@@ -1011,7 +1025,7 @@ MARKER_PATTERNS = [
 ]
 
 # Generic pattern: catches any marker-wavelength pair like CD45-568, CD31-488
-GENERIC_MARKER_RE = re.compile(r'\b([A-Za-z][A-Za-z0-9]*?)[-_](568|647|488)\b')
+GENERIC_MARKER_RE = re.compile(r'\b([A-Za-z][A-Za-z0-9]*?)[-_](567|568|647|488)\b')
 
 STRATEGIES = {
     "AT2_number": {
@@ -1064,21 +1078,17 @@ TAG_COLORS = [
 ]
 
 
-def detect_markers_from_filename(filepath):
+def detect_markers_from_filename(filepath, n_channels=None):
     """Parse the filename to identify markers and channel mapping.
 
     First tries specific known patterns (Ki67, ProSPC, HOPX, aSMA, GFP),
     then falls back to generic MARKER-WAVELENGTH patterns (e.g. CD45-568, CD31-488).
+    n_channels: actual number of channels in the data, used for smart index assignment.
     """
     basename = os.path.basename(filepath)
     name_no_ext = os.path.splitext(basename)[0]
 
     markers = {}
-    channel_map = {}
-
-    # Check if DAPI is mentioned in the filename
-    if re.search(r'\bDAPI\b', name_no_ext, re.IGNORECASE):
-        channel_map["blue"] = 3
 
     # Try specific known patterns first
     for pattern, marker_name, wavelength in MARKER_PATTERNS:
@@ -1093,20 +1103,46 @@ def detect_markers_from_filename(filepath):
         wavelength = match.group(2)
         channel_color = WAVELENGTH_CHANNEL.get(wavelength)
         if channel_color and channel_color not in markers.values():
-            # Don't overwrite already-detected markers for this color
             markers[marker_name] = channel_color
 
-    # Also detect standalone wavelengths for channel_map
-    if re.search(r'\b568\b', name_no_ext):
-        channel_map["red"] = 1
-    if re.search(r'\b647\b', name_no_ext):
-        channel_map["white"] = 0
-    if re.search(r'\b488\b', name_no_ext):
-        channel_map["green"] = 2
+    # Collect which roles are detected from markers + DAPI
+    detected_roles = list(markers.values())  # e.g. ["red", "green"]
+    has_dapi = bool(re.search(r'\bDAPI\b', name_no_ext, re.IGNORECASE))
+    if has_dapi and "blue" not in detected_roles:
+        detected_roles.append("blue")
+    # Also check standalone wavelengths
+    if re.search(r'\b56[78]\b', name_no_ext) and "red" not in detected_roles:
+        detected_roles.append("red")
+    if re.search(r'\b647\b', name_no_ext) and "white" not in detected_roles:
+        detected_roles.append("white")
+    if re.search(r'\b488\b', name_no_ext) and "green" not in detected_roles:
+        detected_roles.append("green")
 
-    # Default: if DAPI not found but other channels detected, assume DAPI exists
-    if "blue" not in channel_map:
-        channel_map["blue"] = 3
+    # Smart channel assignment: assign indices sequentially based on actual channels
+    # DAPI is always the last channel in CZI files from Zeiss microscopes
+    # Other channels are ordered by their appearance in the filename
+    channel_map = {}
+    max_ch = n_channels if n_channels is not None else 4
+
+    # Assign non-DAPI channels first (in order of detection), DAPI last
+    non_dapi = [r for r in detected_roles if r != "blue"]
+    idx = 0
+    for role in non_dapi:
+        if idx < max_ch:
+            channel_map[role] = idx
+            idx += 1
+    # DAPI goes to the last channel
+    if "blue" in detected_roles:
+        dapi_idx = max_ch - 1 if max_ch > 0 else 0
+        # If that index is already taken, use next available
+        used = set(channel_map.values())
+        if dapi_idx in used:
+            for i in range(max_ch - 1, -1, -1):
+                if i not in used:
+                    dapi_idx = i
+                    break
+        if dapi_idx < max_ch:
+            channel_map["blue"] = dapi_idx
 
     return {
         "markers": markers,
@@ -1840,10 +1876,11 @@ def read_image(filepath):
         raise ValueError(f"不支持的文件格式: {ext}")
 
 
-def detect_channels(meta_xml, filepath=None):
+def detect_channels(meta_xml, filepath=None, n_channels=None):
     """Parse CZI XML metadata and return {role: channel_index}.
     If meta_xml is None (TIF files), use filename-based detection as primary.
     For CZI files, try XML metadata first, then fall back to filename detection.
+    n_channels: actual number of channels in the data, used to filter invalid indices.
     """
     mapping = {}
 
@@ -1867,21 +1904,34 @@ def detect_channels(meta_xml, filepath=None):
         except Exception:
             pass
 
+    # Filter out indices that exceed actual channel count
+    if n_channels is not None:
+        mapping = {r: i for r, i in mapping.items() if i < n_channels}
+
     # If XML didn't provide enough info, try filename-based detection
-    if len(mapping) < 4 and filepath:
-        fn_info = detect_markers_from_filename(filepath)
+    if filepath:
+        fn_info = detect_markers_from_filename(filepath, n_channels=n_channels)
         fn_map = fn_info["channel_map"]
         for role, idx in fn_map.items():
             if role not in mapping:
-                mapping[role] = idx
+                if n_channels is None or idx < n_channels:
+                    mapping[role] = idx
 
-    # Fallback: assume standard order if detection still incomplete
-    if len(mapping) < 4:
-        default = {0: "white", 1: "red", 2: "green", 3: "blue"}
-        for idx in range(4):
-            role = default.get(idx)
-            if role and role not in mapping:
-                mapping[role] = idx
+    # Fallback: assign remaining channels only if there are unassigned indices
+    max_ch = n_channels if n_channels is not None else 4
+    used_indices = set(mapping.values())
+    if len(mapping) < max_ch:
+        default_order = ["white", "red", "green", "blue"]
+        for role in default_order:
+            if role not in mapping:
+                # Find next available index
+                for idx in range(max_ch):
+                    if idx not in used_indices:
+                        mapping[role] = idx
+                        used_indices.add(idx)
+                        break
+            if len(mapping) >= max_ch:
+                break
     return mapping
 
 
@@ -1981,7 +2031,9 @@ def count_at2(labels, green_channel, threshold, ring_width):
 
 
 def make_composite(data, channel_map, show_channels, contrast_pct=(0.5, 99.8)):
-    """Build RGBA composite from selected channels with percentile contrast."""
+    """Build RGBA composite from selected channels with percentile contrast.
+    Supports all roles in COMPOSITE_RGB (blue, red, green, white, cyan, magenta, yellow, orange).
+    """
     h, w = data.shape[1], data.shape[2]
     composite = np.zeros((h, w, 3), dtype=np.float64)
 
@@ -1992,23 +2044,18 @@ def make_composite(data, channel_map, show_channels, contrast_pct=(0.5, 99.8)):
             hi = lo + 1
         return np.clip((img.astype(np.float64) - lo) / (hi - lo), 0, 1)
 
-    if show_channels.get("blue") and "blue" in channel_map:
-        ch = enhance(data[channel_map["blue"]])
-        composite[:, :, 2] += ch
-
-    if show_channels.get("red") and "red" in channel_map:
-        ch = enhance(data[channel_map["red"]])
-        composite[:, :, 0] += ch
-
-    if show_channels.get("green") and "green" in channel_map:
-        ch = enhance(data[channel_map["green"]])
-        composite[:, :, 1] += ch
-
-    if show_channels.get("white") and "white" in channel_map:
-        ch = enhance(data[channel_map["white"]])
-        composite[:, :, 0] += ch * 0.7
-        composite[:, :, 1] += ch * 0.7
-        composite[:, :, 2] += ch * 0.7
+    for role, idx in channel_map.items():
+        if not show_channels.get(role):
+            continue
+        if idx >= data.shape[0]:
+            continue
+        rgb = COMPOSITE_RGB.get(role)
+        if rgb is None:
+            continue
+        ch = enhance(data[idx])
+        for c in range(3):
+            if rgb[c] > 0:
+                composite[:, :, c] += ch * rgb[c]
 
     composite = np.clip(composite * 255, 0, 255).astype(np.uint8)
     return composite
@@ -2052,12 +2099,13 @@ def analyze_czi(filepath, params, progress_fn=None):
     data, meta_xml, annotations = read_image(filepath)
 
     # Filename-based marker detection
-    fn_info = detect_markers_from_filename(filepath)
+    n_channels = data.shape[0]
+    fn_info = detect_markers_from_filename(filepath, n_channels=n_channels)
     detected_markers = fn_info["markers"]
     applicable_strategies = determine_strategy(detected_markers)
 
     # Channel mapping: use user overrides if provided, else auto-detect
-    auto_map = detect_channels(meta_xml, filepath)
+    auto_map = detect_channels(meta_xml, filepath, n_channels=n_channels)
     channel_map = {}
     for role in CHANNEL_ROLES:
         override = params.get(f"ch_{role}")
@@ -2473,24 +2521,18 @@ class MainWindow(QMainWindow):
         self.strategy_label.setWordWrap(True)
         left_layout.addWidget(self.strategy_label)
 
-        # -- Channel Assignment card --
-        ch_group = QGroupBox("通道分配")
-        ch_grid = QGridLayout()
-        ch_grid.setSpacing(8)
+        # -- Channel Assignment card (dynamic, per-channel) --
+        self._ch_group = QGroupBox("通道分配")
+        self._ch_grid = QGridLayout()
+        self._ch_grid.setSpacing(8)
+        self._ch_role_combos = {}   # {channel_idx: QComboBox} - selects role/color
+        self._ch_marker_labels = {} # {channel_idx: QLabel} - (legacy, kept for compat)
+        self._ch_idx_labels = {}    # {channel_idx: QLabel} - channel name labels
+        self._ch_group.setLayout(self._ch_grid)
+        left_layout.addWidget(self._ch_group)
+        # Legacy compatibility aliases (will be dynamically managed)
         self.ch_combos = {}
-        self._ch_label_widgets = {}  # role -> QLabel, for dynamic update
-        for i, role in enumerate(CHANNEL_ROLES):
-            lbl = QLabel(CHANNEL_LABELS[role])
-            lbl.setStyleSheet("font-size: 15px;")
-            ch_grid.addWidget(lbl, i, 0)
-            self._ch_label_widgets[role] = lbl
-            combo = QComboBox()
-            combo.addItems(["自动检测", "通道 0", "通道 1", "通道 2", "通道 3"])
-            combo.setToolTip(f"手动指定 {role} 通道")
-            self.ch_combos[role] = combo
-            ch_grid.addWidget(combo, i, 1)
-        ch_group.setLayout(ch_grid)
-        left_layout.addWidget(ch_group)
+        self._ch_label_widgets = {}
 
         # -- DAPI Settings card --
         dapi_group = QGroupBox("DAPI 阈值设置")
@@ -2664,21 +2706,13 @@ class MainWindow(QMainWindow):
 
         toggle_layout.addWidget(QLabel("通道:"))
 
-        self.ch_toggles = {}
-        ch_colors = {"blue": "#60a5fa", "red": "#f87171", "green": "#4ade80", "white": "#e0e0e0"}
-        for role, label in [("blue", "Blue"), ("red", "Red"), ("green", "Green"), ("white", "White")]:
-            btn = QPushButton(label)
-            btn.setObjectName("toggleBtn")
-            btn.setCheckable(True)
-            btn.setChecked(True)
-            color = ch_colors[role]
-            btn.setStyleSheet(
-                f"QPushButton {{ color: {color}; border: 1px solid {color}; }}"
-                f"QPushButton:checked {{ background-color: {color}; color: #1a1a2e; }}"
-            )
-            btn.clicked.connect(self._refresh_display)
-            self.ch_toggles[role] = btn
-            toggle_layout.addWidget(btn)
+        # Dynamic channel toggle container
+        self._toggle_ch_container = QWidget()
+        self._toggle_ch_layout = QHBoxLayout(self._toggle_ch_container)
+        self._toggle_ch_layout.setContentsMargins(0, 0, 0, 0)
+        self._toggle_ch_layout.setSpacing(6)
+        self.ch_toggles = {}  # {channel_idx: QPushButton}
+        toggle_layout.addWidget(self._toggle_ch_container)
 
         # Separator
         sep = QFrame()
@@ -2875,26 +2909,147 @@ class MainWindow(QMainWindow):
     def _toggle_dapi_slider(self, state):
         self.dapi_slider.setEnabled(state != Qt.Checked)
 
-    # ----- BUG 1: Update channel assignment labels -----
-    def _update_channel_labels(self, markers):
-        """Update channel combo labels based on detected markers.
-        markers: dict like {"Ki67": "red", "ProSPC": "white", "HOPX": "green"}
-        """
-        # Build reverse map: role -> marker_name
-        role_to_marker = {}
-        for marker_name, role in markers.items():
-            role_to_marker[role] = marker_name
+    def _on_channel_role_changed(self):
+        """When user changes a channel's role dropdown, prevent duplicates and refresh."""
+        sender = self.sender()
+        changed_idx = None
+        for idx, combo in self._ch_role_combos.items():
+            if combo is sender:
+                changed_idx = idx
+                break
+        if changed_idx is None:
+            return
 
-        ROLE_CN = {"blue": "蓝色", "red": "红色", "green": "绿色", "white": "白色"}
-        for role, lbl_widget in self._ch_label_widgets.items():
-            cn = ROLE_CN.get(role, role)
-            marker = role_to_marker.get(role)
+        selected_role = ROLE_OPTIONS[sender.currentIndex()]
+        # Prevent duplicate role assignment: unset same role from other channels
+        if selected_role != "none":
+            for idx, combo in self._ch_role_combos.items():
+                if idx != changed_idx and ROLE_OPTIONS[combo.currentIndex()] == selected_role:
+                    combo.blockSignals(True)
+                    combo.setCurrentIndex(0)  # set to "不分配"
+                    combo.blockSignals(False)
+
+        self._update_toggle_colors()
+        if self.current_result is not None:
+            self._refresh_display()
+        elif self._current_file:
+            self._preview_file()
+
+    def _get_channel_map_from_ui(self):
+        """Build channel_map {role: channel_idx} from current UI role combos."""
+        channel_map = {}
+        for idx, combo in self._ch_role_combos.items():
+            role = ROLE_OPTIONS[combo.currentIndex()]
+            if role != "none" and role not in channel_map:
+                channel_map[role] = idx
+        return channel_map
+
+    def _get_show_channels(self):
+        """Build show dict {role: bool} from toggle buttons."""
+        show = {}
+        for idx, btn in self.ch_toggles.items():
+            if idx in self._ch_role_combos:
+                role = ROLE_OPTIONS[self._ch_role_combos[idx].currentIndex()]
+                if role != "none":
+                    show[role] = btn.isChecked()
+        return show
+
+    def _adapt_ui_to_channels(self, n_channels, channel_map):
+        """Rebuild channel assignment UI and toggle bar for actual channel count."""
+        self._rebuild_channel_grid(n_channels, channel_map)
+        self._rebuild_toggle_buttons(n_channels, channel_map)
+
+    def _rebuild_channel_grid(self, n_channels, channel_map):
+        """Rebuild the per-channel role assignment grid."""
+        # Clear existing
+        while self._ch_grid.count():
+            item = self._ch_grid.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        self._ch_role_combos.clear()
+        self._ch_marker_labels.clear()
+        self._ch_idx_labels = {}
+
+        # Reverse map: idx -> role
+        idx_to_role = {idx: role for role, idx in channel_map.items()}
+
+        for i in range(n_channels):
+            role = idx_to_role.get(i, "none")
+
+            # Channel name label (will be updated with marker name from filename)
+            lbl = QLabel(f"Ch {i}")
+            color = DISPLAY_COLORS_HEX.get(role, "#888")
+            lbl.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {color};")
+            self._ch_grid.addWidget(lbl, i, 0)
+            self._ch_idx_labels[i] = lbl
+
+            # Role/color dropdown
+            combo = QComboBox()
+            combo.addItems(ROLE_OPTIONS_CN)
+            if role in ROLE_OPTIONS:
+                combo.setCurrentIndex(ROLE_OPTIONS.index(role))
+            combo.currentIndexChanged.connect(self._on_channel_role_changed)
+            self._ch_grid.addWidget(combo, i, 1)
+            self._ch_role_combos[i] = combo
+
+        self._ch_group.setTitle(f"通道分配 ({n_channels} 通道)")
+
+    def _rebuild_toggle_buttons(self, n_channels, channel_map):
+        """Rebuild toggle bar buttons for actual channel count."""
+        # Remove old buttons
+        for btn in self.ch_toggles.values():
+            self._toggle_ch_layout.removeWidget(btn)
+            btn.deleteLater()
+        self.ch_toggles.clear()
+
+        idx_to_role = {idx: role for role, idx in channel_map.items()}
+        for i in range(n_channels):
+            role = idx_to_role.get(i, "none")
+            color = DISPLAY_COLORS_HEX.get(role, "#888")
+            btn = QPushButton(f"Ch{i}")
+            btn.setObjectName("toggleBtn")
+            btn.setCheckable(True)
+            btn.setChecked(role != "none")
+            btn.setStyleSheet(
+                f"QPushButton {{ color: {color}; border: 1px solid {color}; }}"
+                f"QPushButton:checked {{ background-color: {color}; color: #1a1a2e; }}"
+            )
+            btn.clicked.connect(self._refresh_display)
+            self.ch_toggles[i] = btn
+            self._toggle_ch_layout.addWidget(btn)
+
+    def _update_toggle_colors(self):
+        """Update toggle button colors to match current role assignments."""
+        for idx, btn in self.ch_toggles.items():
+            if idx in self._ch_role_combos:
+                role = ROLE_OPTIONS[self._ch_role_combos[idx].currentIndex()]
+                color = DISPLAY_COLORS_HEX.get(role, "#888")
+                btn.setStyleSheet(
+                    f"QPushButton {{ color: {color}; border: 1px solid {color}; }}"
+                    f"QPushButton:checked {{ background-color: {color}; color: #1a1a2e; }}"
+                )
+
+    def _update_channel_labels(self, markers):
+        """Update channel names on grid and toggle buttons using filename-derived marker names.
+        markers: dict like {"Ki67": "red", "ProSPC": "white"}
+        """
+        role_to_marker = {role: name for name, role in markers.items()}
+        for idx, combo in self._ch_role_combos.items():
+            role = ROLE_OPTIONS[combo.currentIndex()]
             if role == "blue":
-                lbl_widget.setText(f"{cn} (DAPI)")
-            elif marker:
-                lbl_widget.setText(f"{cn} ({marker})")
+                name = "DAPI"
             else:
-                lbl_widget.setText(cn)
+                name = role_to_marker.get(role, "")
+            color = DISPLAY_COLORS_HEX.get(role, "#888")
+            # Update channel index label to show marker name
+            if idx in self._ch_idx_labels:
+                label = name if name else f"Ch {idx}"
+                self._ch_idx_labels[idx].setText(label)
+                self._ch_idx_labels[idx].setStyleSheet(f"font-size: 14px; font-weight: bold; color: {color};")
+            # Update toggle button text
+            if idx in self.ch_toggles:
+                self.ch_toggles[idx].setText(name if name else f"Ch{idx}")
 
     # ----- FEATURE 3: Dynamic sidebar -----
     def _update_sidebar_for_strategy(self, markers, strategies):
@@ -3008,6 +3163,9 @@ class MainWindow(QMainWindow):
         if cached and "data" in cached and "labels" in cached:
             self.current_result = cached
             self._update_results_display(cached)
+            # Adapt channel UI for this file
+            if "data" in cached and "channel_map" in cached:
+                self._adapt_ui_to_channels(cached["data"].shape[0], cached["channel_map"])
             # Update dynamic UI elements
             detected_markers = cached.get("detected_markers", {})
             applicable = cached.get("applicable_strategies", [])
@@ -3120,6 +3278,8 @@ class MainWindow(QMainWindow):
         if cached and "data" in cached and "labels" in cached:
             self.current_result = cached
             self._update_results_display(cached)
+            if "channel_map" in cached:
+                self._adapt_ui_to_channels(cached["data"].shape[0], cached["channel_map"])
             detected_markers = cached.get("detected_markers", {})
             applicable = cached.get("applicable_strategies", [])
             self._update_channel_labels(detected_markers)
@@ -3179,6 +3339,8 @@ class MainWindow(QMainWindow):
         if cached and "data" in cached and "labels" in cached:
             self.current_result = cached
             self._update_results_display(cached)
+            if "channel_map" in cached:
+                self._adapt_ui_to_channels(cached["data"].shape[0], cached["channel_map"])
             detected_markers = cached.get("detected_markers", {})
             applicable = cached.get("applicable_strategies", [])
             self._update_channel_labels(detected_markers)
@@ -3206,6 +3368,8 @@ class MainWindow(QMainWindow):
         if cached and "data" in cached and "labels" in cached:
             self.current_result = cached
             self._update_results_display(cached)
+            if "channel_map" in cached:
+                self._adapt_ui_to_channels(cached["data"].shape[0], cached["channel_map"])
             detected_markers = cached.get("detected_markers", {})
             applicable = cached.get("applicable_strategies", [])
             self._update_channel_labels(detected_markers)
@@ -3226,12 +3390,13 @@ class MainWindow(QMainWindow):
             "ring_width": self.ring_slider.value(),
             "min_nucleus": self.nuc_slider.value(),
         }
+        # Read channel assignments from UI role combos
+        ui_map = self._get_channel_map_from_ui()
         for role in CHANNEL_ROLES:
-            idx = self.ch_combos[role].currentIndex()
-            if idx == 0:
-                params[f"ch_{role}"] = -1  # auto
+            if role in ui_map:
+                params[f"ch_{role}"] = ui_map[role]
             else:
-                params[f"ch_{role}"] = idx - 1
+                params[f"ch_{role}"] = -1  # auto
         return params
 
     # ----- Preview -----
@@ -3248,13 +3413,16 @@ class MainWindow(QMainWindow):
 
         try:
             data, meta_xml, annotations = read_image(self._current_file)
-            channel_map = detect_channels(meta_xml, self._current_file)
-            # Apply user overrides
-            for role in CHANNEL_ROLES:
-                idx = self.ch_combos[role].currentIndex()
-                if idx > 0:
-                    channel_map[role] = idx - 1
-            show = {role: self.ch_toggles[role].isChecked() for role in CHANNEL_ROLES}
+            n_ch = data.shape[0]
+            channel_map = detect_channels(meta_xml, self._current_file, n_channels=n_ch)
+            # Rebuild UI for this file's channel count (only on first load or channel count change)
+            if len(self._ch_role_combos) != n_ch:
+                self._adapt_ui_to_channels(n_ch, channel_map)
+            # Use UI role assignments (user may have overridden)
+            ui_map = self._get_channel_map_from_ui()
+            if ui_map:
+                channel_map = ui_map
+            show = self._get_show_channels()
             composite = make_composite(data, channel_map, show)
             h, w, _ = composite.shape
             qimg = QImage(composite.data.tobytes(), w, h, 3 * w, QImage.Format_RGB888)
@@ -3270,7 +3438,7 @@ class MainWindow(QMainWindow):
             self._update_annotation_count()
 
             # Update strategy detection label and dynamic UI
-            fn_info = detect_markers_from_filename(self._current_file)
+            fn_info = detect_markers_from_filename(self._current_file, n_channels=n_ch)
             detected_markers = fn_info["markers"]
             applicable = determine_strategy(detected_markers)
             if applicable:
@@ -3458,11 +3626,19 @@ class MainWindow(QMainWindow):
             return []
 
     def _save_annotations_json(self, filepath):
-        """Save annotations to .annotations.json file."""
+        """Save annotations to .annotations.json file. Only saves if there are annotations."""
         if not filepath:
             return
         points = self.viewer.get_annotations()
         json_path = filepath + ".annotations.json"
+        if not points:
+            # No annotations: remove existing json file if it exists
+            if os.path.isfile(json_path):
+                try:
+                    os.remove(json_path)
+                except Exception:
+                    pass
+            return
         try:
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump({"points": [list(p) for p in points]}, f)
@@ -3578,6 +3754,10 @@ class MainWindow(QMainWindow):
         else:
             self.strategy_label.setText("")
             self.strategy_label.hide()
+
+        # Adapt UI to actual channel count from analysis result
+        if "data" in result and "channel_map" in result:
+            self._adapt_ui_to_channels(result["data"].shape[0], result["channel_map"])
 
         # BUG 1: Update channel labels based on detected markers
         self._update_channel_labels(detected_markers)
@@ -3766,8 +3946,11 @@ class MainWindow(QMainWindow):
         r = self.current_result
         if "data" not in r or "labels" not in r:
             return
-        show = {role: self.ch_toggles[role].isChecked() for role in CHANNEL_ROLES}
-        composite = make_composite(r["data"], r["channel_map"], show)
+        # Use UI role assignments for display (user may have overridden auto-detection)
+        ui_map = self._get_channel_map_from_ui()
+        channel_map = ui_map if ui_map else dict(r["channel_map"])
+        show = self._get_show_channels()
+        composite = make_composite(r["data"], channel_map, show)
 
         # Build strategy overlay visibility map
         strategy_show = {}
