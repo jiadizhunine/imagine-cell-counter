@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Imagine - CZI Cell Counter
-Premium dark-theme GUI for counting YAP+ and AT2 cells in .czi microscopy files.
+"""Imagine - CZI Cell Counter v1.2.6
+Premium dark-theme GUI for fluorescence microscopy image analysis.
+Supports AT2/AT1/AF/Immunity/Blood vessel strategies.
 """
 
 import sys
@@ -1022,6 +1023,12 @@ MARKER_PATTERNS = [
     (re.compile(r'[Hh]opx[-_]?488', re.IGNORECASE), "HOPX", "488"),
     (re.compile(r'aSMA[-_]?568', re.IGNORECASE), "aSMA", "568"),
     (re.compile(r'(?<![a-zA-Z])GFP(?![a-zA-Z])', re.IGNORECASE), "GFP", "488"),
+    (re.compile(r'CD45[-_]?568', re.IGNORECASE), "CD45", "568"),
+    (re.compile(r'CD45[-_]?647', re.IGNORECASE), "CD45", "647"),
+    (re.compile(r'CD45[-_]?488', re.IGNORECASE), "CD45", "488"),
+    (re.compile(r'CD31[-_]?568', re.IGNORECASE), "CD31", "568"),
+    (re.compile(r'CD31[-_]?647', re.IGNORECASE), "CD31", "647"),
+    (re.compile(r'CD31[-_]?488', re.IGNORECASE), "CD31", "488"),
 ]
 
 # Generic pattern: catches any marker-wavelength pair like CD45-568, CD31-488
@@ -1058,6 +1065,51 @@ STRATEGIES = {
         "marker_channel": "green",
         "second_channel": "red",
     },
+    "AF_number": {
+        "name": "AF 数量",
+        "desc": "GFP+ 细胞计数",
+        "requires": ["GFP"],
+        "method": "count_colocalized",
+        "marker_channel": "green",
+    },
+    "AF_proliferation": {
+        "name": "AF 增殖",
+        "desc": "GFP+Ki67+ / GFP+",
+        "requires": ["GFP", "Ki67"],
+        "method": "count_double_positive",
+        "marker_channel": "green",
+        "second_channel": "red",
+    },
+    "AF_fibrosis": {
+        "name": "AF 纤维化",
+        "desc": "GFP+αSMA+ / GFP+",
+        "requires": ["GFP", "aSMA"],
+        "method": "count_double_positive",
+        "marker_channel": "green",
+        "second_channel": "red",
+    },
+    "AF_niche": {
+        "name": "AF 微环境",
+        "desc": "GFP+→最近ProSPC+距离",
+        "requires": ["GFP", "ProSPC"],
+        "method": "count_niche_distance",
+        "marker_channel": "green",
+        "second_channel": "white",
+    },
+    "Immunity": {
+        "name": "免疫细胞",
+        "desc": "CD45+ 细胞计数",
+        "requires": ["CD45"],
+        "method": "count_colocalized",
+        "marker_name": "CD45",
+    },
+    "Blood_vessel": {
+        "name": "血管",
+        "desc": "CD31+ 面积/结构",
+        "requires": ["CD31"],
+        "method": "count_area",
+        "marker_name": "CD31",
+    },
 }
 
 # Color mapping for strategy display
@@ -1066,6 +1118,12 @@ STRATEGY_COLORS = {
     "AT2_proliferation": "#f87171", # Red
     "AT1_number": "#4ade80",        # Green
     "AT1_proliferation": "#a78bfa", # Purple
+    "AF_number": "#22d3ee",        # Cyan
+    "AF_proliferation": "#fb923c", # Orange
+    "AF_fibrosis": "#f472b6",      # Pink
+    "AF_niche": "#facc15",         # Yellow
+    "Immunity": "#60a5fa",         # Blue
+    "Blood_vessel": "#c084fc",     # Violet
 }
 
 TAG_COLORS = [
@@ -1148,6 +1206,16 @@ def detect_markers_from_filename(filepath, n_channels=None):
         "markers": markers,
         "channel_map": channel_map,
     }
+
+
+def _thresh_key_for_channel(ch):
+    """Map channel role to parameter threshold key."""
+    if ch == "red":
+        return "red_thresh"
+    elif ch == "white":
+        return "white_thresh"
+    else:
+        return "green_thresh"
 
 
 def determine_strategy(markers):
@@ -1459,6 +1527,58 @@ def count_double_positive(labels, marker_data, second_data, marker_thresh, secon
     second_means = ndimage.mean(second_filtered, labels, range(1, n + 1))
     return [i + 1 for i, (mm, sm) in enumerate(zip(marker_means, second_means))
             if mm >= marker_thresh and sm >= second_thresh]
+
+
+def count_niche_distance(labels, gfp_data, prospc_data, gfp_thresh, prospc_thresh):
+    """For each GFP+ cell, compute distance to nearest ProSPC+ cell centroid.
+
+    Returns (gfp_positive_labels, distances_list, mean_distance).
+    distances_list has one entry per GFP+ cell (in same order as gfp_positive_labels).
+    """
+    from scipy.spatial import cKDTree
+
+    n = labels.max()
+    if n == 0:
+        return [], [], 0.0
+
+    gfp_means = ndimage.mean(gfp_data, labels, range(1, n + 1))
+    prospc_means = ndimage.mean(prospc_data, labels, range(1, n + 1))
+
+    gfp_positive = [i + 1 for i, m in enumerate(gfp_means) if m >= gfp_thresh]
+    prospc_positive = [i + 1 for i, m in enumerate(prospc_means) if m >= prospc_thresh]
+
+    if not gfp_positive or not prospc_positive:
+        return gfp_positive, [], 0.0
+
+    # Compute centroids for all nuclei
+    centroids = ndimage.center_of_mass(labels > 0, labels, range(1, n + 1))
+
+    gfp_centroids = np.array([centroids[i - 1] for i in gfp_positive])
+    prospc_centroids = np.array([centroids[i - 1] for i in prospc_positive])
+
+    tree = cKDTree(prospc_centroids)
+    distances, _ = tree.query(gfp_centroids, k=1)
+
+    mean_dist = float(np.mean(distances))
+    return gfp_positive, distances.tolist(), mean_dist
+
+
+def count_area(labels, marker_data, threshold):
+    """Measure marker+ area (pixels above threshold).
+
+    Returns (positive_labels, positive_area_px, total_area_px).
+    positive_labels = nuclei that overlap with marker+ regions.
+    """
+    marker_mask = marker_data >= threshold
+    total_area = marker_data.shape[0] * marker_data.shape[1]
+    positive_area = int(np.sum(marker_mask))
+
+    n = labels.max()
+    if n == 0:
+        return [], positive_area, total_area
+    means = ndimage.mean(marker_data, labels, range(1, n + 1))
+    positive_labels = [i + 1 for i, m in enumerate(means) if m >= threshold]
+    return positive_labels, positive_area, total_area
 
 
 # ---------------------------------------------------------------------------
@@ -2134,25 +2254,6 @@ def analyze_czi(filepath, params, progress_fn=None):
         params.get("min_nucleus", 50),
     )
 
-    # Legacy YAP+ counting (kept for backward compat)
-    yap_labels = []
-    if "red" in channel_map:
-        if progress_fn:
-            progress_fn("Counting YAP+ cells...")
-        yap_labels = count_yap(labels, data[channel_map["red"]], params.get("red_thresh", 15))
-
-    # Legacy AT2 counting (kept for backward compat)
-    at2_labels = []
-    if "green" in channel_map:
-        if progress_fn:
-            progress_fn("Counting AT2 cells...")
-        at2_labels = count_at2(
-            labels,
-            data[channel_map["green"]],
-            params.get("green_thresh", 10),
-            params.get("ring_width", 15),
-        )
-
     # Run applicable strategies
     strategy_results = []
     for skey in applicable_strategies:
@@ -2160,8 +2261,12 @@ def analyze_czi(filepath, params, progress_fn=None):
         if progress_fn:
             progress_fn(f"策略: {strat['name']}...")
 
+        # Dynamic channel lookup: use marker_channel if set, else look up from detected_markers
         marker_ch = strat.get("marker_channel")
-        if marker_ch not in channel_map:
+        if marker_ch is None:
+            marker_name = strat.get("marker_name", strat["requires"][0])
+            marker_ch = detected_markers.get(marker_name)
+        if marker_ch is None or marker_ch not in channel_map:
             continue
 
         if strat["method"] == "count_colocalized":
@@ -2302,6 +2407,52 @@ def analyze_czi(filepath, params, progress_fn=None):
                 "refined_labels": use_labels if use_labels is not labels else None,
             })
 
+        elif strat["method"] == "count_niche_distance":
+            # Niche distance: GFP+ → nearest ProSPC+ cell distance
+            second_ch = strat.get("second_channel")
+            if second_ch not in channel_map:
+                continue
+            marker_thresh_key = "green_thresh"
+            second_thresh_key = "white_thresh"
+            gfp_positive, distances, mean_dist = count_niche_distance(
+                labels,
+                data[channel_map[marker_ch]],
+                data[channel_map[second_ch]],
+                params.get(marker_thresh_key, 15),
+                params.get(second_thresh_key, 15),
+            )
+            strategy_results.append({
+                "key": skey,
+                "name": strat["name"],
+                "desc": strat["desc"],
+                "positive_count": len(gfp_positive),
+                "total": total,
+                "percentage": (len(gfp_positive) / total * 100) if total > 0 else 0,
+                "positive_labels": gfp_positive,
+                "mean_distance": mean_dist,
+                "distances": distances,
+            })
+
+        elif strat["method"] == "count_area":
+            # Area measurement (e.g., CD31+ blood vessel area)
+            thresh_key = _thresh_key_for_channel(marker_ch)
+            positive_labels, pos_area, total_area = count_area(
+                labels, data[channel_map[marker_ch]], params.get(thresh_key, 15)
+            )
+            area_pct = (pos_area / total_area * 100) if total_area > 0 else 0
+            strategy_results.append({
+                "key": skey,
+                "name": strat["name"],
+                "desc": strat["desc"],
+                "positive_count": len(positive_labels),
+                "total": total,
+                "percentage": (len(positive_labels) / total * 100) if total > 0 else 0,
+                "positive_labels": positive_labels,
+                "area_positive": pos_area,
+                "area_total": total_area,
+                "area_percentage": area_pct,
+            })
+
     elapsed = time.time() - t0
 
     return {
@@ -2311,12 +2462,12 @@ def analyze_czi(filepath, params, progress_fn=None):
         "channel_map": channel_map,
         "labels": labels,
         "total_nuclei": total,
-        "yap_labels": yap_labels,
-        "yap_count": len(yap_labels),
-        "yap_pct": (len(yap_labels) / total * 100) if total > 0 else 0,
-        "at2_labels": at2_labels,
-        "at2_count": len(at2_labels),
-        "at2_pct": (len(at2_labels) / total * 100) if total > 0 else 0,
+        "yap_labels": [],
+        "yap_count": 0,
+        "yap_pct": 0,
+        "at2_labels": [],
+        "at2_count": 0,
+        "at2_pct": 0,
         "elapsed": elapsed,
         "annotations": annotations,
         "detected_markers": detected_markers,
@@ -2354,7 +2505,7 @@ def _load_logo_icon():
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Imagine")
+        self.setWindowTitle("Imagine v1.2.6")
         # Adaptive window size for 16:9 screens
         screen = QApplication.primaryScreen()
         if screen:
@@ -2735,19 +2886,6 @@ class MainWindow(QMainWindow):
         self._strategy_overlay_layout.setContentsMargins(0, 0, 0, 0)
         self._strategy_overlay_layout.setSpacing(6)
         self._strategy_overlay_btns = {}  # key -> QPushButton
-        # Add legacy YAP+/AT2 buttons as defaults (will be replaced dynamically)
-        self.show_yap_btn = QPushButton("YAP+")
-        self.show_yap_btn.setObjectName("toggleBtn")
-        self.show_yap_btn.setCheckable(True)
-        self.show_yap_btn.setChecked(True)
-        self.show_yap_btn.clicked.connect(self._refresh_display)
-        self._strategy_overlay_layout.addWidget(self.show_yap_btn)
-        self.show_at2_btn = QPushButton("AT2")
-        self.show_at2_btn.setObjectName("toggleBtn")
-        self.show_at2_btn.setCheckable(True)
-        self.show_at2_btn.setChecked(True)
-        self.show_at2_btn.clicked.connect(self._refresh_display)
-        self._strategy_overlay_layout.addWidget(self.show_at2_btn)
         toggle_layout.addWidget(self._strategy_overlay_container)
 
         toggle_layout.addStretch()
@@ -2873,14 +3011,13 @@ class MainWindow(QMainWindow):
         batch_group = QGroupBox("批量结果")
         batch_layout = QVBoxLayout()
         batch_layout.setSpacing(4)
-        self.results_table = QTableWidget(0, 6)
+        self.results_table = QTableWidget(0, 2)
         self.results_table.setAlternatingRowColors(True)
-        self.results_table.setHorizontalHeaderLabels(
-            ["文件名", "细胞核", "YAP+", "YAP%", "AT2", "AT2%"]
-        )
-        self.results_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        for col in range(1, 6):
-            self.results_table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        self.results_table.setHorizontalHeaderLabels(["文件名", "细胞核"])
+        self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.results_table.horizontalHeader().setStretchLastSection(True)
+        self.results_table.horizontalHeader().setMinimumSectionSize(50)
+        self._table_strategy_cols = {}  # strategy_key -> column_index
         self.results_table.verticalHeader().setVisible(False)
         self.results_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.results_table.setSelectionMode(QTableWidget.SingleSelection)
@@ -3102,20 +3239,11 @@ class MainWindow(QMainWindow):
     # ----- FEATURE 4: Dynamic overlay bar -----
     def _update_overlay_bar(self, strategies):
         """Rebuild overlay toggle buttons based on detected strategies."""
-        # Clear old strategy overlay buttons (skip legacy buttons — they are reused)
+        # Clear old strategy overlay buttons
         for key, btn in self._strategy_overlay_btns.items():
             self._strategy_overlay_layout.removeWidget(btn)
-            if not key.startswith("__legacy_"):
-                btn.deleteLater()
+            btn.deleteLater()
         self._strategy_overlay_btns.clear()
-
-        # Also remove legacy buttons from layout if they exist
-        if hasattr(self, 'show_yap_btn'):
-            self._strategy_overlay_layout.removeWidget(self.show_yap_btn)
-            self.show_yap_btn.hide()
-        if hasattr(self, 'show_at2_btn'):
-            self._strategy_overlay_layout.removeWidget(self.show_at2_btn)
-            self.show_at2_btn.hide()
 
         if strategies:
             # Create dynamic buttons for each strategy
@@ -3135,15 +3263,8 @@ class MainWindow(QMainWindow):
                 self._strategy_overlay_layout.addWidget(btn)
                 self._strategy_overlay_btns[skey] = btn
         else:
-            # No strategies detected — show legacy YAP+/AT2 buttons
-            if hasattr(self, 'show_yap_btn'):
-                self.show_yap_btn.show()
-                self._strategy_overlay_layout.addWidget(self.show_yap_btn)
-                self._strategy_overlay_btns["__legacy_yap"] = self.show_yap_btn
-            if hasattr(self, 'show_at2_btn'):
-                self.show_at2_btn.show()
-                self._strategy_overlay_layout.addWidget(self.show_at2_btn)
-                self._strategy_overlay_btns["__legacy_at2"] = self.show_at2_btn
+            # No strategies detected — no overlay buttons to show
+            pass
 
     # ----- FEATURE 5: Double-click table row to jump to file -----
     def _on_table_double_click(self, row, col):
@@ -3217,6 +3338,10 @@ class MainWindow(QMainWindow):
             self.results_table.removeRow(row)
         elif action == delete_all_action:
             self.results_table.setRowCount(0)
+            # Reset dynamic strategy columns back to base 2 columns
+            while self.results_table.columnCount() > 2:
+                self.results_table.removeColumn(self.results_table.columnCount() - 1)
+            self._table_strategy_cols.clear()
             self.batch_results.clear()
             self._batch_results_by_path.clear()
 
@@ -3832,30 +3957,46 @@ class MainWindow(QMainWindow):
             title.setToolTip(sr["desc"])
             c_layout.addWidget(title)
 
-            # Count + percentage row
+            # Count + percentage/metric row
             num_row = QHBoxLayout()
             count_lbl = QLabel(str(sr["positive_count"]))
             count_lbl.setObjectName("bigNumber")
             count_lbl.setStyleSheet(f"color: {color};")
             num_row.addWidget(count_lbl)
 
-            pct_lbl = QLabel(f"{sr['percentage']:.1f}%")
-            pct_lbl.setStyleSheet(f"color: {color}; font-size: 16px; font-weight: bold;")
-            pct_lbl.setAlignment(Qt.AlignRight | Qt.AlignBottom)
-            num_row.addWidget(pct_lbl)
+            # Special display for niche distance
+            if "mean_distance" in sr:
+                metric_lbl = QLabel(f"距离: {sr['mean_distance']:.1f} px")
+                metric_lbl.setStyleSheet(f"color: {color}; font-size: 14px; font-weight: bold;")
+                metric_lbl.setAlignment(Qt.AlignRight | Qt.AlignBottom)
+                num_row.addWidget(metric_lbl)
+            # Special display for area measurement
+            elif "area_percentage" in sr:
+                area_lbl = QLabel(f"面积: {sr['area_percentage']:.1f}%")
+                area_lbl.setStyleSheet(f"color: {color}; font-size: 14px; font-weight: bold;")
+                area_lbl.setAlignment(Qt.AlignRight | Qt.AlignBottom)
+                num_row.addWidget(area_lbl)
+            else:
+                pct_lbl = QLabel(f"{sr['percentage']:.1f}%")
+                pct_lbl.setStyleSheet(f"color: {color}; font-size: 16px; font-weight: bold;")
+                pct_lbl.setAlignment(Qt.AlignRight | Qt.AlignBottom)
+                num_row.addWidget(pct_lbl)
             c_layout.addLayout(num_row)
 
-            # Percentage bar
+            # Percentage/metric bar
+            bar_value = sr.get("area_percentage", sr["percentage"])
             pct_bar = QProgressBar()
             pct_bar.setObjectName("pctBar")
             pct_bar.setRange(0, 100)
-            pct_bar.setValue(min(100, int(sr["percentage"])))
+            pct_bar.setValue(min(100, int(bar_value)))
             pct_bar.setTextVisible(False)
             pct_bar.setStyleSheet(
                 f"QProgressBar#pctBar::chunk {{ background-color: {color}; }}"
                 "QProgressBar#pctBar { background-color: #1a1a2e; border: none; border-radius: 3px; max-height: 6px; min-height: 6px; }"
             )
-            c_layout.addWidget(pct_bar)
+            c_bar_hidden = "mean_distance" in sr  # hide bar for distance metric
+            if not c_bar_hidden:
+                c_layout.addWidget(pct_bar)
 
             self._res_layout.insertWidget(insert_idx, container)
             self._strategy_widgets.append(container)
@@ -3997,24 +4138,47 @@ class MainWindow(QMainWindow):
         qimg = QImage(overlay.data.tobytes(), w, h, 3 * w, QImage.Format_RGB888)
         self.viewer.update_pixmap(QPixmap.fromImage(qimg))
 
+    def _ensure_table_columns(self, strategy_results):
+        """Dynamically add columns for new strategies encountered."""
+        for sr in strategy_results:
+            skey = sr["key"]
+            if skey not in self._table_strategy_cols:
+                col = self.results_table.columnCount()
+                self.results_table.insertColumn(col)
+                self._table_strategy_cols[skey] = col
+                # Use strategy display name as header
+                header_item = QTableWidgetItem(sr["name"])
+                self.results_table.setHorizontalHeaderItem(col, header_item)
+
     def _add_to_table(self, result):
+        strategy_results = result.get("strategy_results", [])
+        self._ensure_table_columns(strategy_results)
+
         row = self.results_table.rowCount()
         self.results_table.insertRow(row)
-        items = [
-            result["filename"],
-            str(result["total_nuclei"]),
-            str(result["yap_count"]),
-            f"{result['yap_pct']:.1f}",
-            str(result["at2_count"]),
-            f"{result['at2_pct']:.1f}",
-        ]
-        for col, text in enumerate(items):
+
+        # Base columns
+        fn_item = QTableWidgetItem(result["filename"])
+        fn_item.setData(Qt.UserRole, result.get("filepath", ""))
+        self.results_table.setItem(row, 0, fn_item)
+
+        nuc_item = QTableWidgetItem(str(result["total_nuclei"]))
+        nuc_item.setTextAlignment(Qt.AlignCenter)
+        self.results_table.setItem(row, 1, nuc_item)
+
+        # Strategy columns
+        for sr in strategy_results:
+            col = self._table_strategy_cols.get(sr["key"])
+            if col is None:
+                continue
+            if "mean_distance" in sr:
+                text = f"{sr['mean_distance']:.1f} px"
+            elif "area_percentage" in sr:
+                text = f"{sr['area_percentage']:.1f}%"
+            else:
+                text = f"{sr['positive_count']} ({sr['percentage']:.1f}%)"
             item = QTableWidgetItem(text)
-            if col > 0:
-                item.setTextAlignment(Qt.AlignCenter)
-            # FEATURE 5: Store filepath as UserRole data on column 0
-            if col == 0:
-                item.setData(Qt.UserRole, result.get("filepath", ""))
+            item.setTextAlignment(Qt.AlignCenter)
             self.results_table.setItem(row, col, item)
 
         # Store minimal result for export (strip large arrays, strip positive_labels from strategies)
@@ -4022,7 +4186,7 @@ class MainWindow(QMainWindow):
         # Strip positive_labels from strategy_results to save memory
         if "strategy_results" in export_result:
             export_result["strategy_results"] = [
-                {k: v for k, v in sr.items() if k not in ("positive_labels", "refined_labels")}
+                {k: v for k, v in sr.items() if k not in ("positive_labels", "refined_labels", "distances")}
                 for sr in export_result["strategy_results"]
             ]
         self.batch_results.append(export_result)
@@ -4134,15 +4298,19 @@ class MainWindow(QMainWindow):
         header = ["Filename", "Total_Nuclei"]
         if has_legacy:
             header += ["YAP_Positive", "YAP_Percent", "AT2_Cells", "AT2_Percent"]
-        strategy_col_map = {}  # key -> (count_col_name, pct_col_name)
+        strategy_col_map = {}  # key -> list of (col_name, data_key) tuples
         for skey in all_strategy_keys:
             strat = STRATEGIES.get(skey, {})
-            base_name = skey  # e.g. AT2_number
-            count_col = f"{base_name}_Count"
-            pct_col = f"{base_name}_Percent"
-            header.append(count_col)
-            header.append(pct_col)
-            strategy_col_map[skey] = (count_col, pct_col)
+            base_name = skey
+            cols = [(f"{base_name}_Count", "positive_count"),
+                    (f"{base_name}_Percent", "percentage")]
+            if strat.get("method") == "count_niche_distance":
+                cols.append((f"{base_name}_MeanDist", "mean_distance"))
+            elif strat.get("method") == "count_area":
+                cols.append((f"{base_name}_AreaPercent", "area_percentage"))
+            for col_name, _ in cols:
+                header.append(col_name)
+            strategy_col_map[skey] = cols
         header.append("Annotations")
 
         with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
@@ -4164,12 +4332,16 @@ class MainWindow(QMainWindow):
                 # Build a lookup from strategy key to result
                 sr_lookup = {sr["key"]: sr for sr in r.get("strategy_results", [])}
                 for skey in all_strategy_keys:
+                    cols = strategy_col_map[skey]
                     if skey in sr_lookup:
-                        row.append(sr_lookup[skey]["positive_count"])
-                        row.append(f"{sr_lookup[skey]['percentage']:.1f}")
+                        for col_name, data_key in cols:
+                            val = sr_lookup[skey].get(data_key, "")
+                            if isinstance(val, float):
+                                row.append(f"{val:.1f}")
+                            else:
+                                row.append(val)
                     else:
-                        row.append("")
-                        row.append("")
+                        row.extend([""] * len(cols))
                 row.append(ann_count)
                 writer.writerow(row)
 
